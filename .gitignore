@@ -1,0 +1,27 @@
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+
+# Model weights and generated artifacts
+models/**/*.safetensors
+models/**/*.bin
+models/**/*.gguf
+models/**/*.onnx
+models/**/*.pt
+models/**/*.pth
+*.apk
+*.aab
+*.so
+
+# Benchmark output and local experiments
+benchmarks/output/
+benchmarks/**/*.jsonl
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
