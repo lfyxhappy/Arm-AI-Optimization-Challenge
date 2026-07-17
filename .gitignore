@@ -5,7 +5,8 @@ local.properties
 *.iml
 .idea/
 
-# Model weights and generated artifacts
+# Local model downloads and generated artifacts
+models/**
 models/**/*.safetensors
 models/**/*.bin
 models/**/*.gguf
