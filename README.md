@@ -59,6 +59,10 @@ Prerequisites: JDK 17, Android SDK Platform 36, NDK `28.1.13356709`, CMake `3.31
 
 The model is deliberately not packaged in the APK. Import it using the Android file picker; for development, first copy a GGUF file to the device with `adb push`.
 
+## Reviewer Test APK
+
+The public [v0.1.0 reviewer APK release](https://github.com/lfyxhappy/Arm-AI-Optimization-Challenge/releases/tag/v0.1.0-reviewer) includes an `arm64-v8a` APK and `SHA256SUMS.txt`. It is deliberately marked as a pre-release because it uses the standard Android debug keystore for evaluator testing; it is not a production-signed distribution. Models are not bundled and must be imported separately.
+
 ## Model Matrix
 
 | Model | Required artifacts | Purpose |
