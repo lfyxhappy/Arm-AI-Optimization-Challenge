@@ -227,6 +227,13 @@
                         android:layout_height="wrap_content"
                         android:text="Auto tune 2/4/6/8" />
 
+                    <Button
+                        android:id="@+id/repeat_selected_thread"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="Repeat selected thread (1 warm-up + 5)" />
+
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"

@@ -12,6 +12,8 @@ Each experiment must have a human-readable stage name, such as `cpu-q4-baseline`
 
 For every thread count, the workbench creates a fresh model context, completes one warm-up run, then records five runs. A fresh context avoids contamination from the previous run's KV cache. Interactive chat may reuse its loaded model and KV context, but those measurements are never mixed into the formal stage benchmark. TTFT starts immediately before the user prompt is submitted and ends on the first streamed non-empty token. tokens/s is emitted output-token count divided by that elapsed stream interval.
 
+When a full `2/4/6/8` pass becomes thermally confounded, use **Repeat selected thread (1 warm-up + 5)** for a cooled control series. It preserves the same immutable v3 JSON/CSV/HTML evidence but contains only the selected candidate. A targeted series is valid only for a same-thread, same-build, same-model, same-input comparison; it does not replace a complete auto-tune stage or establish a new device-wide thread recommendation.
+
 Each record also preserves native model-load, context-init, system-prompt prefill, user-prompt prefill, native decode, TTFT, and end-to-end timings. Do not derive a prefill conclusion from TTFT alone.
 
 For a CPU-versus-accelerator comparison, use the same model hash and preferably the same accelerator-capable APK: run the CPU preference first, then the compiled accelerator preference. Keep batch/ubatch, context configuration, and sampling parameters constant unless the experiment explicitly studies one of them.

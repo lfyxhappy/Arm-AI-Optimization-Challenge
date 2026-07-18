@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-18
 
-Status: The CPU Debug path has a real OnePlus 13 Q4 baseline and corrected peak-memory telemetry as of 2026-07-18. Flash Attention + Q8_0 KV-cache now has an initial same-model device comparison with immutable stage archives; 2/4-thread rows are fully valid, while the 6-thread F16 control needs a cold five-versus-five repeat. OpenCL/HTP SDK builds and device-side accelerator evidence are still pending.
+Status: The CPU Debug path has a real OnePlus 13 Q4 baseline and corrected peak-memory telemetry as of 2026-07-18. Flash Attention + Q8_0 KV-cache now has an initial same-model device comparison with immutable stage archives; 2/4-thread rows are fully valid, while the 6-thread F16 control needs a cold five-versus-five repeat. A complete device capability capture confirms the Snapdragon/Adreno preconditions, but OpenCL/HTP SDK builds and device-side accelerator evidence are still pending.
 
 ## Implementation checkpoint
 
@@ -15,6 +15,7 @@ Status: The CPU Debug path has a real OnePlus 13 Q4 baseline and corrected peak-
 - [x] Add CPU experiment controls for Flash Attention, F16/Q8_0/Q4_0 KV cache, and `batch`/`ubatch`; record split native timings and archive every auto-tune stage without overwriting earlier samples.
 - [x] Add controlled-input fingerprints and a host-side de-duplicated stage comparison report with source SHA-256 manifests, so baseline and optimized sessions can be audited without exporting prompt contents.
 - [-] Initial Flash Attention/Q8_0 KV comparison captured on the OnePlus 13 with deterministic Chinese inputs, matching APK/model hashes, and raw archives. Repeat a cold/randomized F16 6-thread control before making a 6-thread throughput claim; see `docs/oneplus13-flash-q8-kv-results-20260718.md`.
+- [x] Capture OnePlus 13 CPU, Adreno, OpenCL-loader, Vulkan, and Android capability evidence; see [device capability evidence](oneplus13-device-capabilities-20260718.md).
 - [ ] Build and inspect a real OpenCL APK after the Qualcomm SDK is installed.
 - [ ] Build, package-inspect, and quality-gate a real HTP APK after the Hexagon SDK is installed.
 - [ ] Capture the first physical-device CPU-vs-accelerator comparison. Until then, no accelerator performance claim is valid.
@@ -173,7 +174,7 @@ Use one controlled Chinese prompt and deterministic sampling for backend/algorit
 
 ## Near-Term Queue
 
-1. Capture the OnePlus GPU renderer, OpenCL availability, CPU topology, and accelerator capabilities.
+1. [x] Capture the OnePlus GPU renderer, OpenCL loader availability, CPU topology, and accelerator capabilities; see [device capability evidence](oneplus13-device-capabilities-20260718.md).
 2. Implement persistent chat session/KV reuse and split timing.
 3. Build the isolated Adreno OpenCL profile and complete the first CPU vs GPU comparison.
 4. Build the HTP profile only after the Hexagon SDK is available; enforce the Q4_0/Q8_0 and `n_ubatch=16` smoke gate.

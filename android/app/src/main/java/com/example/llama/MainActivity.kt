@@ -64,6 +64,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var importButton: Button
     private lateinit var stagedButton: Button
     private lateinit var tuneButton: Button
+    private lateinit var repeatThreadButton: Button
     private lateinit var sendButton: Button
     private lateinit var stopButton: Button
     private var generationJob: Job? = null
@@ -111,6 +112,7 @@ class MainActivity : AppCompatActivity() {
         importButton = findViewById(R.id.import_model)
         stagedButton = findViewById(R.id.load_staged_model)
         tuneButton = findViewById(R.id.auto_tune)
+        repeatThreadButton = findViewById(R.id.repeat_selected_thread)
         sendButton = findViewById(R.id.send)
         stopButton = findViewById(R.id.stop)
         threads.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, listOf("2", "4", "6", "8"))
@@ -141,6 +143,7 @@ class MainActivity : AppCompatActivity() {
         sendButton.setOnClickListener { sendChat() }
         stopButton.setOnClickListener { stopActiveGeneration() }
         tuneButton.setOnClickListener { autoTune() }
+        repeatThreadButton.setOnClickListener { repeatSelectedThread() }
         findViewById<Button>(R.id.export_json).setOnClickListener { exportCurrentSession("json") }
         findViewById<Button>(R.id.export_csv).setOnClickListener { exportCurrentSession("csv") }
         findViewById<Button>(R.id.export_report).setOnClickListener { exportCurrentSession("html") }
@@ -324,8 +327,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun autoTune() {
+    private fun autoTune() = runBenchmarkSession(THREAD_CANDIDATES, "Auto tuning")
+
+    /**
+     * Runs a cooled control at one selected thread count without first heating
+     * the device through every candidate. The session remains a formal,
+     * immutable stage, but it must be compared only with another targeted
+     * session using the same controlled inputs and selected thread count.
+     */
+    private fun repeatSelectedThread() = runBenchmarkSession(listOf(selectedThreads()), "Targeted repeat")
+
+    private fun runBenchmarkSession(threadCandidates: List<Int>, mode: String) {
         val model = currentModel ?: run { toast("Import a GGUF model first"); return }
+        require(threadCandidates.isNotEmpty()) { "At least one thread candidate is required" }
         val config = selectedRuntimeConfig()
         val stage = selectedStageName()
         val sessionId = UUID.randomUUID().toString()
@@ -335,10 +349,11 @@ class MainActivity : AppCompatActivity() {
         val benchmarkPrompt = BENCHMARK_PROMPT
         val benchmarkInputs = BenchmarkInputs.from(benchmarkSystemPrompt, benchmarkPrompt, benchmarkMaxTokens)
         benchmarkMeasurements.clear()
-        setBusy(true, "Auto tuning $stage: 1 warm-up + 5 measured runs per thread count...")
+        val candidateLabel = threadCandidates.joinToString("/")
+        setBusy(true, "$mode $stage ($candidateLabel threads): 1 warm-up + $MEASURED_RUNS measured runs per thread count...")
         lifecycleScope.launch(Dispatchers.Default) {
             try {
-                for (threadCount in THREAD_CANDIDATES) {
+                for (threadCount in threadCandidates) {
                     statusOnMain("Warm-up at $threadCount threads")
                     benchmarkMeasurements += runBenchmark(
                         model, threadCount, config, benchmarkPrompt, benchmarkSystemPrompt, benchmarkMaxTokens,
@@ -355,11 +370,11 @@ class MainActivity : AppCompatActivity() {
                 val archive = archiveBenchmarkSession(stage, config, benchmarkInputs, sessionStartedAt, sessionId, complete = true)
                 val best = BenchmarkExporter.recommended(benchmarkMeasurements)
                 statusOnMain(best?.let {
-                    "Archived $stage (${archive.sessionCount} stages). Recommended: ${it.threads} threads (${it.meanTokensPerSecond.format(2)} mean tokens/s)"
-                } ?: "Archived $stage (${archive.sessionCount} stages). No valid measurements: device thermal status was severe")
+                    "Archived $stage (${archive.sessionCount} stages; $candidateLabel threads). Recommended: ${it.threads} threads (${it.meanTokensPerSecond.format(2)} mean tokens/s)"
+                } ?: "Archived $stage (${archive.sessionCount} stages; $candidateLabel threads). No valid measurements: device thermal status was severe")
                 withContext(Dispatchers.Main) { refreshArchiveStatus() }
             } catch (error: Exception) {
-                withContext(Dispatchers.Main) { showError("Auto tuning failed", error) }
+                withContext(Dispatchers.Main) { showError("$mode failed", error) }
             } finally {
                 if (benchmarkMeasurements.isNotEmpty() && currentBenchmarkSession?.id != sessionId) {
                     runCatching {
@@ -585,6 +600,7 @@ class MainActivity : AppCompatActivity() {
         importButton.isEnabled = !busy
         stagedButton.isEnabled = !busy
         tuneButton.isEnabled = !busy
+        repeatThreadButton.isEnabled = !busy
         sendButton.isEnabled = !busy
         stopButton.isEnabled = !busy
         threads.isEnabled = !busy

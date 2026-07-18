@@ -20,6 +20,8 @@ The app extends the official `llama.cpp` Android sample with functionality that 
 
 The portable reference is **`arm64-v8a` CPU inference** with the upstream `llama.cpp` CPU path, KleidiAI, and OpenMP. The repository also exposes opt-in `snapdragon-opencl` and `snapdragon-htp` build profiles. They are integration paths, not performance claims: no accelerator result is publishable until the expected device, actual layer-offload log, coherent Chinese smoke response, and repeated thermally valid measurements have been captured. QNN and Vulkan remain later comparative experiments.
 
+The physical OnePlus 13 has a recorded Snapdragon/Adreno capability inventory, including Adreno 830 and vendor OpenCL libraries. That makes GPUOpenCL a valid next experiment, not a proven backend; see [the device capability evidence](docs/oneplus13-device-capabilities-20260718.md).
+
 ## Build
 
 Prerequisites: JDK 17, Android SDK Platform 36, NDK `28.1.13356709`, CMake `3.31.6`, and Git Bash on Windows.
@@ -76,7 +78,7 @@ Download source weights only from the model publisher and accept its licence bef
 
 ## Benchmark Protocol
 
-The app fixes the Chinese benchmark prompt, system prompt, temperature, and maximum output tokens while it tests 2, 4, 6, and 8 threads. For each setting it executes one warm-up and five measured runs. The recommendation first maximizes the mean valid tokens/s and then minimizes mean TTFT. Full details and reporting fields are in [docs/benchmark-protocol.md](docs/benchmark-protocol.md).
+The app fixes the Chinese benchmark prompt, system prompt, temperature, and maximum output tokens while it tests 2, 4, 6, and 8 threads. For each setting it executes one warm-up and five measured runs. A cooled single-thread repeat is also available for a strict same-thread control, but does not replace a full auto-tune stage. The recommendation first maximizes the mean valid tokens/s and then minimizes mean TTFT. Full details and reporting fields are in [docs/benchmark-protocol.md](docs/benchmark-protocol.md).
 
 Use a physical OnePlus 13 for submission numbers. Emulator results and a successful build do not validate Arm performance or thermals.
 
