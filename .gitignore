@@ -17,10 +17,23 @@ models/**/*.pth
 *.aab
 *.so
 
+# Exact upstream source is materialized locally by tools/fetch-llama.ps1.
+third_party/llama.cpp/
+!third_party/UPSTREAM.md
+
 # Benchmark output and local experiments
 benchmarks/output/
 benchmarks/**/*.jsonl
+benchmark-*.json
+benchmark-*.csv
+benchmark-*.html
 *.log
+
+# Local QA artifacts
+.playwright-cli/
+scratch/
+scratch-*.png
+scratch-*.xml
 
 # OS and editor files
 .DS_Store
