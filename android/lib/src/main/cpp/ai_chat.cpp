@@ -1,5 +1,6 @@
 #include <android/log.h>
 #include <jni.h>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -37,13 +38,18 @@ constexpr int   OVERFLOW_HEADROOM       = 4;
 constexpr int   BACKEND_PREFERENCE_AUTO = 0;
 constexpr int   BACKEND_PREFERENCE_CPU = 1;
 constexpr int   BACKEND_PREFERENCE_ACCELERATOR = 2;
+constexpr int   KV_CACHE_F16            = 0;
+constexpr int   KV_CACHE_Q8_0           = 1;
+constexpr int   KV_CACHE_Q4_0           = 2;
+constexpr int   MIN_BATCH_SIZE          = 16;
+constexpr int   MAX_BATCH_SIZE          = 1024;
 // The current upstream HTP backend has a public Qwen/OnePlus regression at an
 // ubatch boundary of 32.  Keep the experimental HTP profile below that boundary
 // until the device-side smoke test proves a newer backend is safe.
 #if AICHAT_ENABLE_HEXAGON
-constexpr int   BATCH_SIZE              = 16;
+constexpr int   DEFAULT_BATCH_SIZE      = 16;
 #else
-constexpr int   BATCH_SIZE              = 512;
+constexpr int   DEFAULT_BATCH_SIZE      = 512;
 #endif
 constexpr float DEFAULT_SAMPLER_TEMP    = 0.3f;
 
@@ -55,6 +61,10 @@ static common_sampler                   * g_sampler;
 static int                                 g_configured_threads = 4;
 static float                               g_configured_temperature = DEFAULT_SAMPLER_TEMP;
 static int                                 g_backend_preference = BACKEND_PREFERENCE_AUTO;
+static int                                 g_configured_flash_attention = LLAMA_FLASH_ATTN_TYPE_AUTO;
+static int                                 g_configured_kv_cache_type = KV_CACHE_F16;
+static int                                 g_configured_batch_size = DEFAULT_BATCH_SIZE;
+static int                                 g_configured_ubatch_size = DEFAULT_BATCH_SIZE;
 static std::vector<ggml_backend_dev_t>     g_model_devices;
 static std::string                         g_requested_device = "CPU";
 static std::string                         g_active_device = "CPU";
@@ -62,6 +72,39 @@ static std::string                         g_backend_fallback_reason;
 static std::string                         g_layer_offload = "0 layers (CPU)";
 static bool                                g_offload_log_seen = false;
 static int                                 g_offloaded_layer_count = 0;
+static double                              g_model_load_ms = -1.0;
+static double                              g_context_init_ms = -1.0;
+static double                              g_system_prefill_ms = -1.0;
+static double                              g_prompt_prefill_ms = -1.0;
+static double                              g_native_decode_ms = -1.0;
+
+using steady_clock = std::chrono::steady_clock;
+
+static double elapsed_ms(const steady_clock::time_point &started) {
+    return std::chrono::duration<double, std::milli>(steady_clock::now() - started).count();
+}
+
+static llama_flash_attn_type configured_flash_attention() {
+    switch (g_configured_flash_attention) {
+        case LLAMA_FLASH_ATTN_TYPE_ENABLED:
+            return LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        case LLAMA_FLASH_ATTN_TYPE_DISABLED:
+            return LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        default:
+            return LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
+}
+
+static ggml_type configured_kv_cache_type() {
+    switch (g_configured_kv_cache_type) {
+        case KV_CACHE_Q8_0:
+            return GGML_TYPE_Q8_0;
+        case KV_CACHE_Q4_0:
+            return GGML_TYPE_Q4_0;
+        default:
+            return GGML_TYPE_F16;
+    }
+}
 
 static const char *compiled_backend_profile() {
 #if AICHAT_ENABLE_HEXAGON
@@ -179,6 +222,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject /*unu
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path) {
+    const auto started = steady_clock::now();
+    g_model_load_ms = -1.0;
     llama_model_params model_params = llama_model_default_params();
     const bool requested_accelerator = configure_model_offload(model_params);
 
@@ -199,6 +244,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     }
     env->ReleaseStringUTFChars(jmodel_path, model_path);
     if (!model) {
+        g_model_load_ms = elapsed_ms(started);
         return 1;
     }
     if (requested_accelerator && g_backend_fallback_reason.empty()) {
@@ -212,6 +258,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
         }
     }
     g_model = model;
+    g_model_load_ms = elapsed_ms(started);
     return 0;
 }
 
@@ -237,10 +284,13 @@ static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT
              __func__, trained_context_size, n_ctx);
     }
     ctx_params.n_ctx = n_ctx;
-    ctx_params.n_batch = BATCH_SIZE;
-    ctx_params.n_ubatch = BATCH_SIZE;
+    ctx_params.n_batch = g_configured_batch_size;
+    ctx_params.n_ubatch = g_configured_ubatch_size;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
+    ctx_params.flash_attn_type = configured_flash_attention();
+    ctx_params.type_k = configured_kv_cache_type();
+    ctx_params.type_v = configured_kv_cache_type();
     auto *context = llama_init_from_model(g_model, ctx_params);
     if (context == nullptr) {
         LOGe("%s: llama_new_context_with_model() returned null)", __func__);
@@ -257,12 +307,21 @@ static common_sampler *new_sampler(float temp) {
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv * /*env*/, jobject /*unused*/) {
+    const auto started = steady_clock::now();
+    g_context_init_ms = -1.0;
     auto *context = init_context(g_model);
-    if (!context) { return 1; }
+    if (!context) {
+        g_context_init_ms = elapsed_ms(started);
+        return 1;
+    }
     g_context = context;
-    g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
+    g_batch = llama_batch_init(g_configured_batch_size, 0, 1);
     g_chat_templates = common_chat_templates_init(g_model, "");
     g_sampler = new_sampler(g_configured_temperature);
+    g_system_prefill_ms = -1.0;
+    g_prompt_prefill_ms = -1.0;
+    g_native_decode_ms = -1.0;
+    g_context_init_ms = elapsed_ms(started);
     return 0;
 }
 
@@ -309,14 +368,29 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_systemInfo(JNIEnv *env, jobject
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_setNativeRuntimeConfig(
-        JNIEnv * /*env*/, jobject /*unused*/, jint threads, jfloat temperature, jint backendPreference) {
+        JNIEnv * /*env*/, jobject /*unused*/, jint threads, jfloat temperature, jint backendPreference,
+        jint flashAttention, jint kvCacheType, jint batchSize, jint ubatchSize) {
     g_configured_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX, (int) threads));
     g_configured_temperature = std::max(0.0f, std::min(2.0f, (float) temperature));
     g_backend_preference = backendPreference >= BACKEND_PREFERENCE_AUTO &&
                            backendPreference <= BACKEND_PREFERENCE_ACCELERATOR
             ? backendPreference : BACKEND_PREFERENCE_AUTO;
-    LOGi("Runtime configuration: threads=%d temperature=%.2f backend=%s", g_configured_threads,
-         g_configured_temperature, configured_backend_preference());
+    g_configured_flash_attention = flashAttention >= LLAMA_FLASH_ATTN_TYPE_AUTO &&
+                                   flashAttention <= LLAMA_FLASH_ATTN_TYPE_ENABLED
+            ? flashAttention : LLAMA_FLASH_ATTN_TYPE_AUTO;
+    g_configured_kv_cache_type = kvCacheType >= KV_CACHE_F16 && kvCacheType <= KV_CACHE_Q4_0
+            ? kvCacheType : KV_CACHE_F16;
+    g_configured_batch_size = std::max(MIN_BATCH_SIZE, std::min(MAX_BATCH_SIZE, (int) batchSize));
+    g_configured_ubatch_size = std::max(MIN_BATCH_SIZE, std::min(g_configured_batch_size, (int) ubatchSize));
+#if AICHAT_ENABLE_HEXAGON
+    // Keep the public OnePlus/Qwen HTP experiment below the known prefill
+    // regression boundary until a device-side quality gate proves otherwise.
+    g_configured_ubatch_size = std::min(g_configured_ubatch_size, 16);
+#endif
+    LOGi("Runtime configuration: threads=%d temperature=%.2f backend=%s flash_attn=%s kv=%s batch=%d ubatch=%d",
+         g_configured_threads, g_configured_temperature, configured_backend_preference(),
+         llama_flash_attn_type_name(configured_flash_attention()),
+         ggml_type_name(configured_kv_cache_type()), g_configured_batch_size, g_configured_ubatch_size);
 }
 
 extern "C"
@@ -337,8 +411,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeBackend(JNIEnv *env, job
           << "; layer_offload=" << g_layer_offload
           << "; registered_backends=" << get_registered_backends()
           << "; registered_devices=" << get_registered_devices()
-          << "; batch=" << BATCH_SIZE
-          << "; ubatch=" << BATCH_SIZE;
+          << "; flash_attn=" << llama_flash_attn_type_name(configured_flash_attention())
+          << "; kv_cache=" << ggml_type_name(configured_kv_cache_type())
+          << "; batch=" << g_configured_batch_size
+          << "; ubatch=" << g_configured_ubatch_size;
     if (!g_backend_fallback_reason.empty()) {
         value << "; fallback=" << g_backend_fallback_reason;
     }
@@ -391,13 +467,55 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeFallbackReason(JNIEnv *e
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeBatchSize(JNIEnv *, jobject /*unused*/) {
-    return BATCH_SIZE;
+    return g_configured_batch_size;
 }
 
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeUbatchSize(JNIEnv *, jobject /*unused*/) {
-    return BATCH_SIZE;
+    return g_configured_ubatch_size;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeFlashAttention(JNIEnv *, jobject /*unused*/) {
+    return g_configured_flash_attention;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeKvCacheType(JNIEnv *, jobject /*unused*/) {
+    return g_configured_kv_cache_type;
+}
+
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeModelLoadMs(JNIEnv *, jobject /*unused*/) {
+    return g_model_load_ms;
+}
+
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeContextInitMs(JNIEnv *, jobject /*unused*/) {
+    return g_context_init_ms;
+}
+
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeSystemPrefillMs(JNIEnv *, jobject /*unused*/) {
+    return g_system_prefill_ms;
+}
+
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_runtimePromptPrefillMs(JNIEnv *, jobject /*unused*/) {
+    return g_prompt_prefill_ms;
+}
+
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_runtimeNativeDecodeMs(JNIEnv *, jobject /*unused*/) {
+    return g_native_decode_ms;
 }
 
 extern "C"
@@ -606,8 +724,8 @@ static int decode_tokens_in_batches(
         const bool compute_last_logit = false) {
     // Process tokens in batches using the global batch
     LOGd("%s: Decode %d tokens starting at position %d", __func__, (int) tokens.size(), start_pos);
-    for (int i = 0; i < (int) tokens.size(); i += BATCH_SIZE) {
-        const int cur_batch_size = std::min((int) tokens.size() - i, BATCH_SIZE);
+    for (int i = 0; i < (int) tokens.size(); i += g_configured_batch_size) {
+        const int cur_batch_size = std::min((int) tokens.size() - i, g_configured_batch_size);
         common_batch_clear(batch);
         LOGv("%s: Preparing a batch size of %d starting at: %d", __func__, cur_batch_size, i);
 
@@ -642,6 +760,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         jobject /*unused*/,
         jstring jsystem_prompt
 ) {
+    const auto started = steady_clock::now();
+    g_system_prefill_ms = -1.0;
     // Reset long-term & short-term states
     reset_long_term_states();
     reset_short_term_states();
@@ -670,17 +790,20 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     if ((int) system_tokens.size() > max_batch_size) {
         LOGe("%s: System prompt too long for context! %d tokens, max: %d",
              __func__, (int) system_tokens.size(), max_batch_size);
+        g_system_prefill_ms = elapsed_ms(started);
         return 1;
     }
 
     // Decode system tokens in batches
     if (decode_tokens_in_batches(g_context, g_batch, system_tokens, current_position)) {
         LOGe("%s: llama_decode() failed!", __func__);
+        g_system_prefill_ms = elapsed_ms(started);
         return 2;
     }
 
     // Update position
     system_prompt_position = current_position = (int) system_tokens.size();
+    g_system_prefill_ms = elapsed_ms(started);
     return 0;
 }
 
@@ -692,6 +815,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
         jstring juser_prompt,
         jint n_predict
 ) {
+    const auto started = steady_clock::now();
+    g_prompt_prefill_ms = -1.0;
+    g_native_decode_ms = 0.0;
     // Reset short-term states
     reset_short_term_states();
 
@@ -725,6 +851,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     // Decode user tokens in batches
     if (decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true)) {
         LOGe("%s: llama_decode() failed!", __func__);
+        g_prompt_prefill_ms = elapsed_ms(started);
         return 2;
     }
 
@@ -734,6 +861,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     // Do not add user_prompt_size a second time or generation can exceed the
     // requested max-token limit and distort benchmark measurements.
     stop_generation_position = current_position + n_predict;
+    g_prompt_prefill_ms = elapsed_ms(started);
     return 0;
 }
 
@@ -789,6 +917,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
         return nullptr;
     }
 
+    const auto decode_started = steady_clock::now();
     // Sample next token
     const auto new_token_id = common_sampler_sample(g_sampler, g_context, -1);
     common_sampler_accept(g_sampler, new_token_id, true);
@@ -797,9 +926,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     common_batch_clear(g_batch);
     common_batch_add(g_batch, new_token_id, current_position, {0}, true);
     if (llama_decode(g_context, g_batch) != 0) {
+        g_native_decode_ms += elapsed_ms(decode_started);
         LOGe("%s: llama_decode() failed for generated token", __func__);
         return nullptr;
     }
+    g_native_decode_ms += elapsed_ms(decode_started);
 
     // Update position
     current_position++;

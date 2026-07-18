@@ -21,11 +21,7 @@ interface InferenceEngine {
     suspend fun loadModel(pathToModel: String)
 
     /** Configure the next model context. Changes take effect on the next load. */
-    suspend fun setRuntimeConfig(
-        threads: Int,
-        temperature: Float,
-        backendPreference: BackendPreference = BackendPreference.AUTO,
-    )
+    suspend fun setRuntimeConfig(config: RuntimeConfig)
 
     /** Build and backend details used in an exported benchmark artifact. */
     fun runtimeInfo(): RuntimeInfo
@@ -97,6 +93,53 @@ enum class BackendPreference(val nativeValue: Int, val uiLabel: String) {
     ACCELERATOR(2, "Accelerator (compiled profile)"),
 }
 
+/** Requested Flash Attention policy for the next native context. */
+enum class FlashAttentionMode(val nativeValue: Int, val uiLabel: String) {
+    AUTO(-1, "Flash attention: Auto"),
+    ENABLED(1, "Flash attention: On"),
+    DISABLED(0, "Flash attention: Off"),
+}
+
+/** A shared K/V cache precision that llama.cpp supports for this experiment. */
+enum class KvCacheType(val nativeValue: Int, val uiLabel: String) {
+    F16(0, "KV cache: F16"),
+    Q8_0(1, "KV cache: Q8_0"),
+    Q4_0(2, "KV cache: Q4_0"),
+}
+
+/**
+ * Context construction inputs. Keeping this immutable lets every benchmark
+ * record identify the exact configuration used to build its fresh context.
+ */
+data class RuntimeConfig(
+    val threads: Int = 4,
+    val temperature: Float = 0.3f,
+    val backendPreference: BackendPreference = BackendPreference.AUTO,
+    val flashAttention: FlashAttentionMode = FlashAttentionMode.AUTO,
+    val kvCacheType: KvCacheType = KvCacheType.F16,
+    val batchSize: Int = 512,
+    val ubatchSize: Int = 512,
+) {
+    init {
+        require(threads in 1..8) { "Thread count must be 1..8" }
+        require(temperature in 0f..2f) { "Temperature must be 0.0..2.0" }
+        require(batchSize in 16..1024) { "Batch size must be 16..1024" }
+        require(ubatchSize in 16..batchSize) { "uBatch size must be 16..batch size" }
+        require(kvCacheType == KvCacheType.F16 || flashAttention != FlashAttentionMode.DISABLED) {
+            "Quantized KV cache requires Flash Attention to be Auto or On"
+        }
+    }
+}
+
+/** Native timings for the most recently completed load/prompt/generation flow. */
+data class RuntimeTiming(
+    val modelLoadMs: Double,
+    val contextInitMs: Double,
+    val systemPrefillMs: Double,
+    val promptPrefillMs: Double,
+    val nativeDecodeMs: Double,
+)
+
 data class RuntimeInfo(
     val configuredThreads: Int,
     val temperature: Float,
@@ -113,6 +156,9 @@ data class RuntimeInfo(
     val fallbackReason: String?,
     val batchSize: Int,
     val ubatchSize: Int,
+    val flashAttention: FlashAttentionMode,
+    val kvCacheType: KvCacheType,
+    val timing: RuntimeTiming,
 )
 
 val State.isUninterruptible

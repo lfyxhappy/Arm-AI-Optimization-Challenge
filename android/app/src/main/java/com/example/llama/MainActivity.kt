@@ -20,7 +20,10 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.arm.aichat.AiChat
 import com.arm.aichat.BackendPreference
+import com.arm.aichat.FlashAttentionMode
 import com.arm.aichat.InferenceEngine
+import com.arm.aichat.KvCacheType
+import com.arm.aichat.RuntimeConfig
 import com.arm.aichat.RuntimeInfo
 import com.arm.aichat.gguf.GgufMetadata
 import com.arm.aichat.gguf.GgufMetadataReader
@@ -51,16 +54,26 @@ class MainActivity : AppCompatActivity() {
     private lateinit var maxTokens: EditText
     private lateinit var threads: Spinner
     private lateinit var backendMode: Spinner
+    private lateinit var flashAttentionMode: Spinner
+    private lateinit var kvCacheType: Spinner
+    private lateinit var batchSize: EditText
+    private lateinit var ubatchSize: EditText
+    private lateinit var stageName: EditText
+    private lateinit var archiveStatus: TextView
     private lateinit var messageAdapter: MessageAdapter
     private lateinit var importButton: Button
     private lateinit var stagedButton: Button
     private lateinit var tuneButton: Button
+    private lateinit var sendButton: Button
+    private lateinit var stopButton: Button
     private var generationJob: Job? = null
     @Volatile private var stopRequested = false
     private var currentModel: ImportedModel? = null
     private val messages = mutableListOf<Message>()
     private val interactiveMeasurements = mutableListOf<BenchmarkMeasurement>()
     private val benchmarkMeasurements = mutableListOf<BenchmarkMeasurement>()
+    private var currentBenchmarkSession: BenchmarkSession? = null
+    private var activeChatSession: ActiveChatSession? = null
     private var pendingExport: ExportDocument? = null
 
     private val modelPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -89,15 +102,33 @@ class MainActivity : AppCompatActivity() {
         maxTokens = findViewById(R.id.max_tokens)
         threads = findViewById(R.id.threads)
         backendMode = findViewById(R.id.backend_mode)
+        flashAttentionMode = findViewById(R.id.flash_attention_mode)
+        kvCacheType = findViewById(R.id.kv_cache_type)
+        batchSize = findViewById(R.id.batch_size)
+        ubatchSize = findViewById(R.id.ubatch_size)
+        stageName = findViewById(R.id.stage_name)
+        archiveStatus = findViewById(R.id.archive_status)
         importButton = findViewById(R.id.import_model)
         stagedButton = findViewById(R.id.load_staged_model)
         tuneButton = findViewById(R.id.auto_tune)
+        sendButton = findViewById(R.id.send)
+        stopButton = findViewById(R.id.stop)
         threads.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, listOf("2", "4", "6", "8"))
         threads.setSelection(1)
         backendMode.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
             BACKEND_PREFERENCES.map { it.uiLabel },
+        )
+        flashAttentionMode.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            FlashAttentionMode.values().map { it.uiLabel },
+        )
+        kvCacheType.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            KvCacheType.values().map { it.uiLabel },
         )
         val recycler = findViewById<RecyclerView>(R.id.messages)
         recycler.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
@@ -107,12 +138,14 @@ class MainActivity : AppCompatActivity() {
         importButton.setOnClickListener { modelPicker.launch(arrayOf("application/octet-stream", "*/*")) }
         stagedButton.setOnClickListener { loadStagedModel() }
         refreshStagedModelButton()
-        findViewById<Button>(R.id.send).setOnClickListener { sendChat() }
-        findViewById<Button>(R.id.stop).setOnClickListener { stopActiveGeneration() }
+        sendButton.setOnClickListener { sendChat() }
+        stopButton.setOnClickListener { stopActiveGeneration() }
         tuneButton.setOnClickListener { autoTune() }
-        findViewById<Button>(R.id.export_json).setOnClickListener { export("benchmark.json", "application/json", BenchmarkExporter.json(currentModel, benchmarkMeasurements)) }
-        findViewById<Button>(R.id.export_csv).setOnClickListener { export("benchmark.csv", "text/csv", BenchmarkExporter.csv(benchmarkMeasurements)) }
-        findViewById<Button>(R.id.export_report).setOnClickListener { export("baseline-vs-optimized.html", "text/html", BenchmarkExporter.report(currentModel, benchmarkMeasurements)) }
+        findViewById<Button>(R.id.export_json).setOnClickListener { exportCurrentSession("json") }
+        findViewById<Button>(R.id.export_csv).setOnClickListener { exportCurrentSession("csv") }
+        findViewById<Button>(R.id.export_report).setOnClickListener { exportCurrentSession("html") }
+        findViewById<Button>(R.id.export_all_stages).setOnClickListener { exportAllStages() }
+        refreshArchiveStatus()
 
         lifecycleScope.launch(Dispatchers.Default) {
             engine = AiChat.getInferenceEngine(applicationContext)
@@ -127,15 +160,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun importModel(uri: Uri) {
         setBusy(true, "Validating GGUF metadata...")
-        val configuredThreads = selectedThreads()
-        val configuredTemperature = selectedTemperature()
-        val configuredBackend = selectedBackendPreference()
+        val config = selectedRuntimeConfig()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val metadata = contentResolver.openInputStream(uri)?.use { GgufMetadataReader.create().readStructuredMetadata(it) }
                     ?: error("Unable to read the selected file")
                 val imported = copyAndHash(uri, metadata)
-                configureAndLoad(imported, configuredThreads, configuredTemperature, configuredBackend)
+                configureAndLoad(imported, config)
                 currentModel = imported
                 withContext(Dispatchers.Main) {
                     modelInfo.text = imported.describe(metadata)
@@ -164,14 +195,12 @@ class MainActivity : AppCompatActivity() {
         val file = stagedModelFile()
         if (!file.isFile) return
         setBusy(true, "Reading staged GGUF metadata...")
-        val configuredThreads = selectedThreads()
-        val configuredTemperature = selectedTemperature()
-        val configuredBackend = selectedBackendPreference()
+        val config = selectedRuntimeConfig()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val metadata = FileInputStream(file).use { GgufMetadataReader.create().readStructuredMetadata(it) }
                 val imported = ImportedModel(file, sha256(file), file.length(), metadata.basic.name ?: "staged GGUF")
-                configureAndLoad(imported, configuredThreads, configuredTemperature, configuredBackend)
+                configureAndLoad(imported, config)
                 currentModel = imported
                 withContext(Dispatchers.Main) {
                     modelInfo.text = imported.describe(metadata)
@@ -226,22 +255,37 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun configureAndLoad(
         model: ImportedModel,
-        threads: Int,
-        temp: Float,
-        backendPreference: BackendPreference,
+        config: RuntimeConfig,
     ) {
         if (engine.state.value !is InferenceEngine.State.Initialized) engine.cleanUp()
-        engine.setRuntimeConfig(threads, temp, backendPreference)
+        engine.setRuntimeConfig(config)
         engine.loadModel(model.file.absolutePath)
+        activeChatSession = null
+    }
+
+    private suspend fun ensureInteractiveSession(
+        model: ImportedModel,
+        config: RuntimeConfig,
+        configuredSystemPrompt: String,
+    ) {
+        val existing = activeChatSession
+        if (existing != null &&
+            existing.modelSha256 == model.sha256 &&
+            existing.config == config &&
+            existing.systemPrompt == configuredSystemPrompt &&
+            engine.state.value is InferenceEngine.State.ModelReady
+        ) return
+
+        configureAndLoad(model, config)
+        engine.setSystemPrompt(configuredSystemPrompt)
+        activeChatSession = ActiveChatSession(model.sha256, config, configuredSystemPrompt)
     }
 
     private fun sendChat() {
         val prompt = input.text.toString().trim()
         val model = currentModel
         if (prompt.isEmpty() || model == null) return
-        val configuredThreads = selectedThreads()
-        val configuredTemperature = selectedTemperature()
-        val configuredBackend = selectedBackendPreference()
+        val config = selectedRuntimeConfig()
         val configuredSystemPrompt = systemPrompt.text.toString().ifBlank { DEFAULT_SYSTEM_PROMPT }
         val configuredMaxTokens = selectedMaxTokens()
         stopRequested = false
@@ -252,8 +296,7 @@ class MainActivity : AppCompatActivity() {
         messageAdapter.notifyItemRangeInserted(messages.size - 2, 2)
         generationJob = lifecycleScope.launch(Dispatchers.Default) {
             try {
-                configureAndLoad(model, configuredThreads, configuredTemperature, configuredBackend)
-                engine.setSystemPrompt(configuredSystemPrompt)
+                ensureInteractiveSession(model, config, configuredSystemPrompt)
                 val started = System.nanoTime()
                 var firstTokenAt = 0L
                 var tokens = 0
@@ -269,6 +312,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (!stopRequested) recordInteractiveMeasurement(model, tokens, started, firstTokenAt)
             } catch (error: Exception) {
+                activeChatSession = null
                 withContext(Dispatchers.Main) { showError("Generation failed", error) }
             } finally {
                 withContext(NonCancellable + Dispatchers.Main) {
@@ -282,39 +326,89 @@ class MainActivity : AppCompatActivity() {
 
     private fun autoTune() {
         val model = currentModel ?: run { toast("Import a GGUF model first"); return }
-        val temp = selectedTemperature()
-        val backendPreference = selectedBackendPreference()
+        val config = selectedRuntimeConfig()
+        val stage = selectedStageName()
+        val sessionId = UUID.randomUUID().toString()
+        val sessionStartedAt = Instant.now().toString()
         val benchmarkSystemPrompt = systemPrompt.text.toString().ifBlank { DEFAULT_SYSTEM_PROMPT }
         val benchmarkMaxTokens = selectedMaxTokens()
         benchmarkMeasurements.clear()
-        setBusy(true, "Auto tuning new session: 1 warm-up + 5 measured runs per thread count...")
+        setBusy(true, "Auto tuning $stage: 1 warm-up + 5 measured runs per thread count...")
         lifecycleScope.launch(Dispatchers.Default) {
             try {
                 val prompt = BENCHMARK_PROMPT
                 for (threadCount in THREAD_CANDIDATES) {
                     statusOnMain("Warm-up at $threadCount threads")
-                    benchmarkMeasurements += runBenchmark(model, threadCount, temp, backendPreference, prompt, benchmarkSystemPrompt, benchmarkMaxTokens, warmup = true)
+                    benchmarkMeasurements += runBenchmark(
+                        model, threadCount, config, prompt, benchmarkSystemPrompt, benchmarkMaxTokens,
+                        sessionId, stage, warmup = true,
+                    )
                     repeat(MEASURED_RUNS) { index ->
                         statusOnMain("Measuring $threadCount threads: ${index + 1}/$MEASURED_RUNS")
-                        benchmarkMeasurements += runBenchmark(model, threadCount, temp, backendPreference, prompt, benchmarkSystemPrompt, benchmarkMaxTokens, warmup = false)
+                        benchmarkMeasurements += runBenchmark(
+                            model, threadCount, config, prompt, benchmarkSystemPrompt, benchmarkMaxTokens,
+                            sessionId, stage, warmup = false,
+                        )
                     }
                 }
+                val archive = archiveBenchmarkSession(stage, config, sessionStartedAt, sessionId, complete = true)
                 val best = BenchmarkExporter.recommended(benchmarkMeasurements)
                 statusOnMain(best?.let {
-                    "Recommended: ${it.threads} threads (${it.meanTokensPerSecond.format(2)} mean tokens/s)"
-                } ?: "No valid measurements: device thermal status was severe")
+                    "Archived $stage (${archive.sessionCount} stages). Recommended: ${it.threads} threads (${it.meanTokensPerSecond.format(2)} mean tokens/s)"
+                } ?: "Archived $stage (${archive.sessionCount} stages). No valid measurements: device thermal status was severe")
+                withContext(Dispatchers.Main) { refreshArchiveStatus() }
             } catch (error: Exception) {
                 withContext(Dispatchers.Main) { showError("Auto tuning failed", error) }
             } finally {
+                if (benchmarkMeasurements.isNotEmpty() && currentBenchmarkSession?.id != sessionId) {
+                    runCatching {
+                        archiveBenchmarkSession(stage, config, sessionStartedAt, sessionId, complete = false)
+                    }.onSuccess {
+                        withContext(Dispatchers.Main) { refreshArchiveStatus() }
+                    }
+                }
                 withContext(Dispatchers.Main) { setBusy(false) }
             }
         }
     }
 
-    private suspend fun runBenchmark(model: ImportedModel, threadCount: Int, temp: Float, backendPreference: BackendPreference, prompt: String, benchmarkSystemPrompt: String, benchmarkMaxTokens: Int, warmup: Boolean): BenchmarkMeasurement {
+    private fun archiveBenchmarkSession(
+        stage: String,
+        config: RuntimeConfig,
+        startedAt: String,
+        sessionId: String,
+        complete: Boolean,
+    ): BenchmarkArchiveResult {
+        val session = BenchmarkArchiveStore.createSession(
+            this,
+            stage,
+            config,
+            benchmarkMeasurements.toList(),
+            complete,
+            startedAt,
+            sessionId,
+        )
+        val archive = BenchmarkArchiveStore(this).archive(session)
+        currentBenchmarkSession = session
+        return archive
+    }
+
+    private suspend fun runBenchmark(
+        model: ImportedModel,
+        threadCount: Int,
+        config: RuntimeConfig,
+        prompt: String,
+        benchmarkSystemPrompt: String,
+        benchmarkMaxTokens: Int,
+        sessionId: String,
+        stage: String,
+        warmup: Boolean,
+    ): BenchmarkMeasurement {
         val before = DeviceTelemetry.capture(this)
-        if (before.isSevere) return BenchmarkMeasurement.skipped(model, threadCount, temp, backendPreference, before, warmup, "Thermal status is SEVERE or higher")
-        configureAndLoad(model, threadCount, temp, backendPreference)
+        if (before.isSevere) return BenchmarkMeasurement.skipped(
+            model, threadCount, config, sessionId, stage, before, warmup, "Thermal status is SEVERE or higher",
+        )
+        configureAndLoad(model, config.copy(threads = threadCount))
         engine.setSystemPrompt(benchmarkSystemPrompt)
         val started = System.nanoTime()
         var firstTokenAt = 0L
@@ -331,8 +425,9 @@ class MainActivity : AppCompatActivity() {
             runtimeValidityIssue(runtime),
         ).joinToString("; ").ifBlank { null }
         return BenchmarkMeasurement(
-            timestamp = Instant.now().toString(), modelName = model.displayName, modelSha256 = model.sha256,
-            modelBytes = model.bytes, threads = threadCount, temperature = temp, outputTokens = tokens,
+            sessionId = sessionId, stage = stage, timestamp = Instant.now().toString(), modelName = model.displayName,
+            modelSha256 = model.sha256, modelBytes = model.bytes, threads = threadCount,
+            temperature = config.temperature, outputTokens = tokens,
             ttftMs = if (firstTokenAt == 0L) -1.0 else (firstTokenAt - started) / 1_000_000.0,
             elapsedMs = (ended - started) / 1_000_000.0,
             tokensPerSecond = if (tokens == 0) 0.0 else tokens * 1_000_000_000.0 / (ended - started),
@@ -342,6 +437,10 @@ class MainActivity : AppCompatActivity() {
             registeredBackends = runtime.registeredBackends, registeredDevices = runtime.registeredDevices,
             layerOffload = runtime.layerOffload, fallbackReason = runtime.fallbackReason,
             batchSize = runtime.batchSize, ubatchSize = runtime.ubatchSize, systemInfo = runtime.systemInfo,
+            flashAttention = runtime.flashAttention.name.lowercase(), kvCacheType = runtime.kvCacheType.name.lowercase(),
+            modelLoadMs = runtime.timing.modelLoadMs, contextInitMs = runtime.timing.contextInitMs,
+            systemPrefillMs = runtime.timing.systemPrefillMs, promptPrefillMs = runtime.timing.promptPrefillMs,
+            nativeDecodeMs = runtime.timing.nativeDecodeMs,
             thermalStatus = after.thermalStatus, batteryTemperatureC = after.batteryTemperatureC,
             batteryCurrentUa = after.batteryCurrentUa, valid = validityIssue == null, warmup = warmup,
             invalidReason = validityIssue,
@@ -357,18 +456,64 @@ class MainActivity : AppCompatActivity() {
             runtimeValidityIssue(runtime),
         ).joinToString("; ").ifBlank { null }
         interactiveMeasurements += BenchmarkMeasurement(
-            Instant.now().toString(), model.displayName, model.sha256, model.bytes, runtime.configuredThreads,
-            runtime.temperature, tokens, if (first == 0L) -1.0 else (first - started) / 1_000_000.0,
-            (ended - started) / 1_000_000.0, if (tokens == 0) 0.0 else tokens * 1e9 / (ended - started),
-            runtime.peakMemoryKb, runtime.backend, runtime.backendProfile, runtime.backendPreference.name.lowercase(),
-            runtime.requestedDevice, runtime.activeDevice, runtime.registeredBackends, runtime.registeredDevices,
-            runtime.layerOffload, runtime.fallbackReason, runtime.batchSize, runtime.ubatchSize, runtime.systemInfo, telemetry.thermalStatus,
-            telemetry.batteryTemperatureC, telemetry.batteryCurrentUa, validityIssue == null, false, validityIssue,
+            sessionId = "interactive",
+            stage = "interactive",
+            timestamp = Instant.now().toString(),
+            modelName = model.displayName,
+            modelSha256 = model.sha256,
+            modelBytes = model.bytes,
+            threads = runtime.configuredThreads,
+            temperature = runtime.temperature,
+            outputTokens = tokens,
+            ttftMs = if (first == 0L) -1.0 else (first - started) / 1_000_000.0,
+            elapsedMs = (ended - started) / 1_000_000.0,
+            tokensPerSecond = if (tokens == 0) 0.0 else tokens * 1e9 / (ended - started),
+            peakMemoryKb = runtime.peakMemoryKb,
+            backend = runtime.backend,
+            backendProfile = runtime.backendProfile,
+            backendPreference = runtime.backendPreference.name.lowercase(),
+            requestedDevice = runtime.requestedDevice,
+            activeDevice = runtime.activeDevice,
+            registeredBackends = runtime.registeredBackends,
+            registeredDevices = runtime.registeredDevices,
+            layerOffload = runtime.layerOffload,
+            fallbackReason = runtime.fallbackReason,
+            batchSize = runtime.batchSize,
+            ubatchSize = runtime.ubatchSize,
+            systemInfo = runtime.systemInfo,
+            flashAttention = runtime.flashAttention.name.lowercase(),
+            kvCacheType = runtime.kvCacheType.name.lowercase(),
+            modelLoadMs = runtime.timing.modelLoadMs,
+            contextInitMs = runtime.timing.contextInitMs,
+            systemPrefillMs = runtime.timing.systemPrefillMs,
+            promptPrefillMs = runtime.timing.promptPrefillMs,
+            nativeDecodeMs = runtime.timing.nativeDecodeMs,
+            thermalStatus = telemetry.thermalStatus,
+            batteryTemperatureC = telemetry.batteryTemperatureC,
+            batteryCurrentUa = telemetry.batteryCurrentUa,
+            valid = validityIssue == null,
+            warmup = false,
+            invalidReason = validityIssue,
         )
     }
 
+    private fun exportCurrentSession(format: String) {
+        val session = currentBenchmarkSession ?: run { toast("Run auto tune before exporting"); return }
+        val slug = session.stage.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "stage" }
+        when (format) {
+            "json" -> export("$slug-${session.id.takeLast(8)}.json", "application/json", BenchmarkExporter.json(session, session.measurements))
+            "csv" -> export("$slug-${session.id.takeLast(8)}.csv", "text/csv", BenchmarkExporter.csv(session, session.measurements))
+            "html" -> export("$slug-${session.id.takeLast(8)}.html", "text/html", BenchmarkExporter.report(session, session.measurements))
+        }
+    }
+
+    private fun exportAllStages() {
+        val history = BenchmarkArchiveStore(this).historyCsvOrNull()
+            ?: run { toast("No archived benchmark stages yet"); return }
+        export("all-benchmark-stages.csv", "text/csv", history)
+    }
+
     private fun export(filename: String, mime: String, content: String) {
-        if (benchmarkMeasurements.isEmpty()) { toast("Run auto tune before exporting"); return }
         pendingExport = ExportDocument(filename, content)
         exportPicker.launch(Intent(Intent.ACTION_CREATE_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE)
@@ -380,6 +525,31 @@ class MainActivity : AppCompatActivity() {
     private fun selectedBackendPreference() = BACKEND_PREFERENCES.getOrElse(backendMode.selectedItemPosition) { BackendPreference.AUTO }
     private fun selectedTemperature() = temperature.text.toString().toFloatOrNull()?.coerceIn(0f, 2f) ?: 0.3f
     private fun selectedMaxTokens() = maxTokens.text.toString().toIntOrNull()?.coerceIn(1, 1024) ?: 96
+    private fun selectedRuntimeConfig(): RuntimeConfig {
+        val kvCache = KvCacheType.values().getOrElse(kvCacheType.selectedItemPosition) { KvCacheType.F16 }
+        var flashAttention = FlashAttentionMode.values().getOrElse(flashAttentionMode.selectedItemPosition) { FlashAttentionMode.AUTO }
+        if (kvCache != KvCacheType.F16 && flashAttention == FlashAttentionMode.DISABLED) {
+            flashAttention = FlashAttentionMode.ENABLED
+            flashAttentionMode.setSelection(FlashAttentionMode.ENABLED.ordinal)
+            toast("Quantized KV cache requires Flash Attention; switched to On")
+        }
+        val batch = batchSize.text.toString().toIntOrNull()?.coerceIn(16, 1024) ?: DEFAULT_BATCH_SIZE
+        val ubatch = ubatchSize.text.toString().toIntOrNull()?.coerceIn(16, batch) ?: batch
+        return RuntimeConfig(
+            threads = selectedThreads(),
+            temperature = selectedTemperature(),
+            backendPreference = selectedBackendPreference(),
+            flashAttention = flashAttention,
+            kvCacheType = kvCache,
+            batchSize = batch,
+            ubatchSize = ubatch,
+        )
+    }
+    private fun selectedStageName() = stageName.text.toString().trim().take(80).ifBlank { "untitled-stage" }
+    private fun refreshArchiveStatus() {
+        val count = BenchmarkArchiveStore(this).sessionCount()
+        archiveStatus.text = if (count == 0) "Archive: no completed benchmark stages yet" else "Archive: $count immutable benchmark stage(s) retained"
+    }
     private fun visibleAssistantText(raw: String): String {
         val start = raw.indexOf("<think>")
         if (start < 0) return raw.replace("</think>", "").trimStart()
@@ -395,6 +565,9 @@ class MainActivity : AppCompatActivity() {
             append(" | active: ").append(runtime.activeDevice)
             append(" | offload: ").append(runtime.layerOffload)
             append("\nBackends: ").append(runtime.registeredBackends)
+            append("\nContext: flash=").append(runtime.flashAttention.name.lowercase())
+            append(" | KV=").append(runtime.kvCacheType.name)
+            append(" | batch=").append(runtime.batchSize).append('/').append(runtime.ubatchSize)
             append("\nPeak memory: ").append(runtime.peakMemoryKb).append(" KB")
             runtime.fallbackReason?.let { append("\nFallback: ").append(it) }
         }
@@ -405,18 +578,40 @@ class MainActivity : AppCompatActivity() {
             "Requested ${runtime.requestedDevice}, but active device is ${runtime.activeDevice}"
         } else null
     }
-    private fun setBusy(busy: Boolean, message: String? = null) { importButton.isEnabled = !busy; tuneButton.isEnabled = !busy; backendMode.isEnabled = !busy; if (message != null) status.text = message }
+    private fun setBusy(busy: Boolean, message: String? = null) {
+        importButton.isEnabled = !busy
+        stagedButton.isEnabled = !busy
+        tuneButton.isEnabled = !busy
+        sendButton.isEnabled = !busy
+        stopButton.isEnabled = !busy
+        threads.isEnabled = !busy
+        temperature.isEnabled = !busy
+        maxTokens.isEnabled = !busy
+        backendMode.isEnabled = !busy
+        flashAttentionMode.isEnabled = !busy
+        kvCacheType.isEnabled = !busy
+        batchSize.isEnabled = !busy
+        ubatchSize.isEnabled = !busy
+        stageName.isEnabled = !busy
+        if (message != null) status.text = message
+    }
     private suspend fun statusOnMain(text: String) = withContext(Dispatchers.Main) { status.text = text }
     private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
     private fun showError(prefix: String, error: Exception) { status.text = "$prefix: ${error.message ?: error.javaClass.simpleName}"; toast(status.text.toString()) }
     private fun stopActiveGeneration() {
         stopRequested = true
+        activeChatSession = null
         if (::engine.isInitialized) engine.stopGeneration()
     }
     override fun onStop() { stopActiveGeneration(); generationJob?.cancel(); super.onStop() }
     override fun onDestroy() { if (::engine.isInitialized) engine.destroy(); super.onDestroy() }
 
     private data class ExportDocument(val filename: String, val content: String)
+    private data class ActiveChatSession(
+        val modelSha256: String,
+        val config: RuntimeConfig,
+        val systemPrompt: String,
+    )
     data class ImportedModel(val file: File, val sha256: String, val bytes: Long, val displayName: String) {
         val filename get() = file.name
         fun describe(metadata: GgufMetadata) = "$displayName\n${(bytes / (1024.0 * 1024.0 * 1024.0)).format(2)} GiB | SHA-256 ${sha256.take(16)}...\n${metadata.basic}"
@@ -425,6 +620,7 @@ class MainActivity : AppCompatActivity() {
         val THREAD_CANDIDATES = listOf(2, 4, 6, 8)
         val BACKEND_PREFERENCES = BackendPreference.values()
         const val MEASURED_RUNS = 5
+        const val DEFAULT_BATCH_SIZE = 512
         const val DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Reply in concise Chinese."
         const val BENCHMARK_PROMPT = "请用中文简要解释：为什么移动端大语言模型需要同时优化量化和线程数？"
     }
@@ -446,19 +642,66 @@ internal data class DeviceTelemetry(val thermalStatus: Int, val batteryTemperatu
 }
 
 internal data class BenchmarkMeasurement(
-    val timestamp: String, val modelName: String, val modelSha256: String, val modelBytes: Long, val threads: Int,
+    val sessionId: String, val stage: String, val timestamp: String, val modelName: String, val modelSha256: String, val modelBytes: Long, val threads: Int,
     val temperature: Float, val outputTokens: Int, val ttftMs: Double, val elapsedMs: Double, val tokensPerSecond: Double,
     val peakMemoryKb: Long, val backend: String, val backendProfile: String, val backendPreference: String,
     val requestedDevice: String, val activeDevice: String, val registeredBackends: String, val registeredDevices: String,
     val layerOffload: String, val fallbackReason: String?, val batchSize: Int, val ubatchSize: Int, val systemInfo: String,
+    val flashAttention: String, val kvCacheType: String,
+    val modelLoadMs: Double, val contextInitMs: Double, val systemPrefillMs: Double, val promptPrefillMs: Double, val nativeDecodeMs: Double,
     val thermalStatus: Int,
     val batteryTemperatureC: Double?, val batteryCurrentUa: Int?, val valid: Boolean, val warmup: Boolean, val invalidReason: String?,
 ) {
     companion object {
-        fun skipped(model: MainActivity.ImportedModel, threads: Int, temp: Float, backendPreference: BackendPreference, telemetry: DeviceTelemetry, warmup: Boolean, reason: String) =
-            BenchmarkMeasurement(Instant.now().toString(), model.displayName, model.sha256, model.bytes, threads, temp, 0, -1.0, 0.0, 0.0, 0,
-                "not-run", "not-loaded", backendPreference.name.lowercase(), "not-loaded", "not-loaded", "not-loaded", "not-loaded",
-                "not-loaded", null, 0, 0, "", telemetry.thermalStatus, telemetry.batteryTemperatureC, telemetry.batteryCurrentUa, false, warmup, reason)
+        fun skipped(
+            model: MainActivity.ImportedModel,
+            threads: Int,
+            config: RuntimeConfig,
+            sessionId: String,
+            stage: String,
+            telemetry: DeviceTelemetry,
+            warmup: Boolean,
+            reason: String,
+        ) = BenchmarkMeasurement(
+            sessionId = sessionId,
+            stage = stage,
+            timestamp = Instant.now().toString(),
+            modelName = model.displayName,
+            modelSha256 = model.sha256,
+            modelBytes = model.bytes,
+            threads = threads,
+            temperature = config.temperature,
+            outputTokens = 0,
+            ttftMs = -1.0,
+            elapsedMs = 0.0,
+            tokensPerSecond = 0.0,
+            peakMemoryKb = 0,
+            backend = "not-run",
+            backendProfile = "not-loaded",
+            backendPreference = config.backendPreference.name.lowercase(),
+            requestedDevice = "not-loaded",
+            activeDevice = "not-loaded",
+            registeredBackends = "not-loaded",
+            registeredDevices = "not-loaded",
+            layerOffload = "not-loaded",
+            fallbackReason = null,
+            batchSize = config.batchSize,
+            ubatchSize = config.ubatchSize,
+            systemInfo = "",
+            flashAttention = config.flashAttention.name.lowercase(),
+            kvCacheType = config.kvCacheType.name.lowercase(),
+            modelLoadMs = -1.0,
+            contextInitMs = -1.0,
+            systemPrefillMs = -1.0,
+            promptPrefillMs = -1.0,
+            nativeDecodeMs = -1.0,
+            thermalStatus = telemetry.thermalStatus,
+            batteryTemperatureC = telemetry.batteryTemperatureC,
+            batteryCurrentUa = telemetry.batteryCurrentUa,
+            valid = false,
+            warmup = warmup,
+            invalidReason = reason,
+        )
     }
 }
 
@@ -495,24 +738,79 @@ internal object BenchmarkExporter {
         )
 
     private fun baseline(items: List<BenchmarkMeasurement>) = summaries(items).firstOrNull()
-    fun json(model: Any?, items: List<BenchmarkMeasurement>) = buildString {
-        append("{\n  \"schema\": \"arm-mobile-ai-benchmark/v1\",\n  \"measurements\": [\n")
-        items.forEachIndexed { index, value -> append("    {").append(value.json()).append("}").append(if (index == items.lastIndex) "\n" else ",\n") }
+
+    fun json(session: BenchmarkSession?, items: List<BenchmarkMeasurement>) = buildString {
+        append("{\n  \"schema\": \"arm-mobile-ai-benchmark/v2\",")
+        if (session != null) append("\n  \"session\": {").append(session.json()).append("},")
+        append("\n  \"measurements\": [\n")
+        items.forEachIndexed { index, value ->
+            append("    {").append(value.json()).append("}")
+            append(if (index == items.lastIndex) "\n" else ",\n")
+        }
         append("  ]\n}\n")
     }
-    fun csv(items: List<BenchmarkMeasurement>) = buildString {
-        append("timestamp,model,sha256,threads,temperature,output_tokens,ttft_ms,tokens_per_second,peak_memory_kb,backend,backend_profile,backend_preference,requested_device,active_device,registered_backends,registered_devices,layer_offload,fallback_reason,batch_size,ubatch_size,thermal_status,battery_temperature_c,battery_current_ua,valid,warmup,invalid_reason\n")
-        items.forEach { append(listOf(it.timestamp,it.modelName,it.modelSha256,it.threads,it.temperature,it.outputTokens,it.ttftMs,it.tokensPerSecond,it.peakMemoryKb,it.backend,it.backendProfile,it.backendPreference,it.requestedDevice,it.activeDevice,it.registeredBackends,it.registeredDevices,it.layerOffload,it.fallbackReason,it.batchSize,it.ubatchSize,it.thermalStatus,it.batteryTemperatureC,it.batteryCurrentUa,it.valid,it.warmup,it.invalidReason).joinToString(",") { csvValue(it) }).append('\n') }
+
+    fun csvHeader() = "session_id,stage,session_complete,timestamp,model,sha256,model_bytes,threads,temperature,output_tokens,ttft_ms,end_to_end_ms,tokens_per_second,peak_memory_kb,backend,backend_profile,backend_preference,requested_device,active_device,registered_backends,registered_devices,layer_offload,fallback_reason,batch_size,ubatch_size,flash_attention,kv_cache_type,model_load_ms,context_init_ms,system_prefill_ms,prompt_prefill_ms,native_decode_ms,thermal_status,battery_temperature_c,battery_current_ua,valid,warmup,invalid_reason\n"
+
+    fun csv(session: BenchmarkSession, items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(items, session.complete)
+
+    fun csv(items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(items)
+
+    fun csvRows(items: List<BenchmarkMeasurement>, sessionComplete: Boolean? = null) = buildString {
+        items.forEach { append(it.csv(sessionComplete)).append('\n') }
     }
-    fun report(model: Any?, items: List<BenchmarkMeasurement>): String {
+
+    fun report(session: BenchmarkSession?, items: List<BenchmarkMeasurement>): String {
         val baseline = baseline(items)
         val optimized = recommended(items)
-        val baselineRuntime = baseline?.runtime
-        val optimizedRuntime = optimized?.runtime
-        return """<!doctype html><html><head><meta charset="utf-8"><title>Arm Mobile AI Report</title><style>body{font-family:sans-serif;margin:32px;color:#17212b}table{border-collapse:collapse;width:100%}th,td{padding:8px;border:1px solid #b9c2ca;text-align:left}th{background:#e8f1f3}</style></head><body><h1>Baseline vs Optimized</h1><p>Generated by Arm Mobile AI Optimization Workbench. Values are means across valid, non-warm-up runs; peak memory is the maximum observed value. SEVERE thermal samples are excluded from the recommendation.</p><table><tr><th>Configuration</th><th>Threads</th><th>Valid runs</th><th>Mean TTFT (ms)</th><th>Mean tokens/s</th><th>Peak memory max (KB)</th></tr><tr><td>Baseline</td><td>${baseline?.threads ?: "n/a"}</td><td>${baseline?.measuredRuns ?: "n/a"}</td><td>${baseline?.meanTtftMs?.format(2) ?: "n/a"}</td><td>${baseline?.meanTokensPerSecond?.format(2) ?: "n/a"}</td><td>${baseline?.maxPeakMemoryKb ?: "n/a"}</td></tr><tr><td>Optimized</td><td>${optimized?.threads ?: "n/a"}</td><td>${optimized?.measuredRuns ?: "n/a"}</td><td>${optimized?.meanTtftMs?.format(2) ?: "n/a"}</td><td>${optimized?.meanTokensPerSecond?.format(2) ?: "n/a"}</td><td>${optimized?.maxPeakMemoryKb ?: "n/a"}</td></tr></table><h2>Runtime evidence</h2><table><tr><th>Field</th><th>Baseline</th><th>Optimized</th></tr><tr><td>Profile</td><td>${baselineRuntime?.backendProfile ?: "n/a"}</td><td>${optimizedRuntime?.backendProfile ?: "n/a"}</td></tr><tr><td>Requested / active</td><td>${baselineRuntime?.requestedDevice ?: "n/a"} / ${baselineRuntime?.activeDevice ?: "n/a"}</td><td>${optimizedRuntime?.requestedDevice ?: "n/a"} / ${optimizedRuntime?.activeDevice ?: "n/a"}</td></tr><tr><td>Layer offload</td><td>${baselineRuntime?.layerOffload ?: "n/a"}</td><td>${optimizedRuntime?.layerOffload ?: "n/a"}</td></tr><tr><td>Batch / ubatch</td><td>${baselineRuntime?.batchSize ?: "n/a"} / ${baselineRuntime?.ubatchSize ?: "n/a"}</td><td>${optimizedRuntime?.batchSize ?: "n/a"} / ${optimizedRuntime?.ubatchSize ?: "n/a"}</td></tr><tr><td>Fallback</td><td>${baselineRuntime?.fallbackReason ?: "none"}</td><td>${optimizedRuntime?.fallbackReason ?: "none"}</td></tr></table><h2>Protocol</h2><p>Per thread: 1 warm-up plus 5 recorded runs with the same Chinese prompt, system prompt, temperature, backend mode, and maximum output tokens.</p></body></html>"""
+        val stage = session?.stage ?: items.firstOrNull()?.stage ?: "unlabeled stage"
+        val config = session?.config
+        return buildString {
+            append("<!doctype html><html><head><meta charset=\"utf-8\"><title>Arm Mobile AI Report</title>")
+            append("<style>body{font-family:sans-serif;margin:32px;color:#17212b}table{border-collapse:collapse;width:100%;margin:12px 0}th,td{padding:8px;border:1px solid #b9c2ca;text-align:left}th{background:#e8f1f3}</style></head><body>")
+            append("<h1>Stage: ").append(html(stage)).append("</h1>")
+            append("<p>Values are means across valid, non-warm-up runs. SEVERE thermal samples are retained but excluded from recommendations.</p>")
+            if (session != null) {
+                append("<h2>Reproducibility</h2><table><tr><th>Session</th><td>").append(html(session.id)).append("</td></tr>")
+                append("<tr><th>Started</th><td>").append(html(session.startedAt)).append("</td></tr>")
+                append("<tr><th>Stage status</th><td>").append(if (session.complete) "completed" else "partial").append("</td></tr>")
+                append("<tr><th>App / ABI</th><td>").append(html(session.appVersion)).append(" / ").append(html(session.abi)).append("</td></tr>")
+                append("<tr><th>Flash / KV / batch</th><td>").append(html(config!!.flashAttention.name)).append(" / ")
+                append(html(config.kvCacheType.name)).append(" / ").append(config.batchSize).append(" / ").append(config.ubatchSize).append("</td></tr></table>")
+            }
+            append("<h2>Baseline vs Optimized</h2><table><tr><th>Configuration</th><th>Threads</th><th>Valid runs</th><th>Mean TTFT (ms)</th><th>Mean tokens/s</th><th>Peak memory max (KB)</th></tr>")
+            append(summaryRow("Baseline", baseline)).append(summaryRow("Optimized", optimized)).append("</table>")
+            append("<h2>Split Timing</h2><table><tr><th>Configuration</th><th>Model load</th><th>Context init</th><th>System prefill</th><th>Prompt prefill</th><th>Native decode</th><th>End-to-end</th></tr>")
+            append(timingRow("Baseline", baseline?.runtime)).append(timingRow("Optimized", optimized?.runtime)).append("</table>")
+            append("<h2>Runtime Evidence</h2><table><tr><th>Configuration</th><th>Profile</th><th>Requested / active</th><th>Flash / KV</th><th>Offload</th><th>Fallback</th></tr>")
+            append(runtimeRow("Baseline", baseline?.runtime)).append(runtimeRow("Optimized", optimized?.runtime)).append("</table>")
+            append("<p>Protocol: one warm-up plus five recorded runs per thread count using a fresh context, fixed prompt, sampling parameters, and this stage configuration.</p></body></html>")
+        }
     }
-    private fun BenchmarkMeasurement.json() = "\"timestamp\":\"${escape(timestamp)}\",\"model\":\"${escape(modelName)}\",\"sha256\":\"$modelSha256\",\"threads\":$threads,\"temperature\":$temperature,\"outputTokens\":$outputTokens,\"ttftMs\":$ttftMs,\"tokensPerSecond\":$tokensPerSecond,\"peakMemoryKb\":$peakMemoryKb,\"backend\":\"${escape(backend)}\",\"backendProfile\":\"${escape(backendProfile)}\",\"backendPreference\":\"${escape(backendPreference)}\",\"requestedDevice\":\"${escape(requestedDevice)}\",\"activeDevice\":\"${escape(activeDevice)}\",\"registeredBackends\":\"${escape(registeredBackends)}\",\"registeredDevices\":\"${escape(registeredDevices)}\",\"layerOffload\":\"${escape(layerOffload)}\",\"fallbackReason\":${fallbackReason?.let { "\"${escape(it)}\"" } ?: "null"},\"batchSize\":$batchSize,\"ubatchSize\":$ubatchSize,\"thermalStatus\":$thermalStatus,\"batteryTemperatureC\":${batteryTemperatureC ?: "null"},\"batteryCurrentUa\":${batteryCurrentUa ?: "null"},\"valid\":$valid,\"warmup\":$warmup,\"invalidReason\":${invalidReason?.let { "\"${escape(it)}\"" } ?: "null"}"
+
+    private fun summaryRow(label: String, value: BenchmarkSummary?) = "<tr><td>${html(label)}</td><td>${value?.threads ?: "n/a"}</td><td>${value?.measuredRuns ?: "n/a"}</td><td>${value?.meanTtftMs?.format(2) ?: "n/a"}</td><td>${value?.meanTokensPerSecond?.format(2) ?: "n/a"}</td><td>${value?.maxPeakMemoryKb ?: "n/a"}</td></tr>"
+
+    private fun timingRow(label: String, value: BenchmarkMeasurement?): String {
+        fun ms(value: Double?) = value?.takeIf { it >= 0.0 }?.format(2) ?: "n/a"
+        return "<tr><td>${html(label)}</td><td>${ms(value?.modelLoadMs)}</td><td>${ms(value?.contextInitMs)}</td><td>${ms(value?.systemPrefillMs)}</td><td>${ms(value?.promptPrefillMs)}</td><td>${ms(value?.nativeDecodeMs)}</td><td>${ms(value?.elapsedMs)}</td></tr>"
+    }
+
+    private fun runtimeRow(label: String, value: BenchmarkMeasurement?): String = "<tr><td>${html(label)}</td><td>${html(value?.backendProfile ?: "n/a")}</td><td>${html(value?.requestedDevice ?: "n/a")} / ${html(value?.activeDevice ?: "n/a")}</td><td>${html(value?.flashAttention ?: "n/a")} / ${html(value?.kvCacheType ?: "n/a")}</td><td>${html(value?.layerOffload ?: "n/a")}</td><td>${html(value?.fallbackReason ?: "none")}</td></tr>"
+
+    private fun BenchmarkSession.json() = "\"id\":\"${escape(id)}\",\"stage\":\"${escape(stage)}\",\"startedAt\":\"${escape(startedAt)}\",\"complete\":$complete,\"appVersion\":\"${escape(appVersion)}\",\"deviceFingerprint\":\"${escape(deviceFingerprint)}\",\"abi\":\"${escape(abi)}\",\"runtimeConfig\":{\"threads\":${config.threads},\"temperature\":${config.temperature},\"backendPreference\":\"${escape(config.backendPreference.name.lowercase())}\",\"flashAttention\":\"${escape(config.flashAttention.name.lowercase())}\",\"kvCacheType\":\"${escape(config.kvCacheType.name.lowercase())}\",\"batchSize\":${config.batchSize},\"ubatchSize\":${config.ubatchSize}}"
+
+    private fun BenchmarkMeasurement.json() = "\"sessionId\":\"${escape(sessionId)}\",\"stage\":\"${escape(stage)}\",\"timestamp\":\"${escape(timestamp)}\",\"model\":\"${escape(modelName)}\",\"sha256\":\"$modelSha256\",\"modelBytes\":$modelBytes,\"threads\":$threads,\"temperature\":$temperature,\"outputTokens\":$outputTokens,\"ttftMs\":$ttftMs,\"endToEndMs\":$elapsedMs,\"tokensPerSecond\":$tokensPerSecond,\"peakMemoryKb\":$peakMemoryKb,\"backend\":\"${escape(backend)}\",\"backendProfile\":\"${escape(backendProfile)}\",\"backendPreference\":\"${escape(backendPreference)}\",\"requestedDevice\":\"${escape(requestedDevice)}\",\"activeDevice\":\"${escape(activeDevice)}\",\"registeredBackends\":\"${escape(registeredBackends)}\",\"registeredDevices\":\"${escape(registeredDevices)}\",\"layerOffload\":\"${escape(layerOffload)}\",\"fallbackReason\":${fallbackReason?.let { "\"${escape(it)}\"" } ?: "null"},\"batchSize\":$batchSize,\"ubatchSize\":$ubatchSize,\"flashAttention\":\"${escape(flashAttention)}\",\"kvCacheType\":\"${escape(kvCacheType)}\",\"modelLoadMs\":$modelLoadMs,\"contextInitMs\":$contextInitMs,\"systemPrefillMs\":$systemPrefillMs,\"promptPrefillMs\":$promptPrefillMs,\"nativeDecodeMs\":$nativeDecodeMs,\"thermalStatus\":$thermalStatus,\"batteryTemperatureC\":${batteryTemperatureC ?: "null"},\"batteryCurrentUa\":${batteryCurrentUa ?: "null"},\"valid\":$valid,\"warmup\":$warmup,\"invalidReason\":${invalidReason?.let { "\"${escape(it)}\"" } ?: "null"}"
+
+    private fun BenchmarkMeasurement.csv(sessionComplete: Boolean?) = listOf(
+        sessionId, stage, sessionComplete, timestamp, modelName, modelSha256, modelBytes, threads, temperature, outputTokens,
+        ttftMs, elapsedMs, tokensPerSecond, peakMemoryKb, backend, backendProfile, backendPreference,
+        requestedDevice, activeDevice, registeredBackends, registeredDevices, layerOffload, fallbackReason,
+        batchSize, ubatchSize, flashAttention, kvCacheType, modelLoadMs, contextInitMs, systemPrefillMs,
+        promptPrefillMs, nativeDecodeMs, thermalStatus, batteryTemperatureC, batteryCurrentUa, valid, warmup, invalidReason,
+    ).joinToString(",") { csvValue(it) }
+
     private fun escape(value: String) = value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+    private fun html(value: String) = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
     private fun csvValue(value: Any?) = "\"${(value?.toString() ?: "").replace("\"", "\"\"")}\""
 }
 

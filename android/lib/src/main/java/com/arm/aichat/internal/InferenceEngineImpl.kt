@@ -3,8 +3,12 @@ package com.arm.aichat.internal
 import android.content.Context
 import android.util.Log
 import com.arm.aichat.BackendPreference
+import com.arm.aichat.FlashAttentionMode
 import com.arm.aichat.InferenceEngine
+import com.arm.aichat.KvCacheType
+import com.arm.aichat.RuntimeConfig
 import com.arm.aichat.RuntimeInfo
+import com.arm.aichat.RuntimeTiming
 import com.arm.aichat.UnsupportedArchitectureException
 import com.arm.aichat.internal.InferenceEngineImpl.Companion.getInstance
 import dalvik.annotation.optimization.FastNative
@@ -51,13 +55,6 @@ internal class InferenceEngineImpl private constructor(
 
     companion object {
         private val TAG = InferenceEngineImpl::class.java.simpleName
-        private const val MIN_THREADS = 1
-        private const val MAX_THREADS = 8
-        private const val DEFAULT_THREADS = 4
-        private const val MIN_TEMPERATURE = 0f
-        private const val MAX_TEMPERATURE = 2f
-        private const val DEFAULT_TEMPERATURE = 0.3f
-
         @Volatile
         private var instance: InferenceEngine? = null
 
@@ -100,7 +97,15 @@ internal class InferenceEngineImpl private constructor(
     private external fun systemInfo(): String
 
     @FastNative
-    private external fun setNativeRuntimeConfig(threads: Int, temperature: Float, backendPreference: Int)
+    private external fun setNativeRuntimeConfig(
+        threads: Int,
+        temperature: Float,
+        backendPreference: Int,
+        flashAttention: Int,
+        kvCacheType: Int,
+        batchSize: Int,
+        ubatchSize: Int,
+    )
 
     @FastNative
     private external fun runtimeBackend(): String
@@ -133,6 +138,27 @@ internal class InferenceEngineImpl private constructor(
     private external fun runtimeUbatchSize(): Int
 
     @FastNative
+    private external fun runtimeFlashAttention(): Int
+
+    @FastNative
+    private external fun runtimeKvCacheType(): Int
+
+    @FastNative
+    private external fun runtimeModelLoadMs(): Double
+
+    @FastNative
+    private external fun runtimeContextInitMs(): Double
+
+    @FastNative
+    private external fun runtimeSystemPrefillMs(): Double
+
+    @FastNative
+    private external fun runtimePromptPrefillMs(): Double
+
+    @FastNative
+    private external fun runtimeNativeDecodeMs(): Double
+
+    @FastNative
     private external fun peakMemoryKb(): Long
 
     @FastNative
@@ -160,9 +186,7 @@ internal class InferenceEngineImpl private constructor(
     private var _readyForSystemPrompt = false
     @Volatile
     private var _cancelGeneration = false
-    private var configuredThreads = DEFAULT_THREADS
-    private var configuredTemperature = DEFAULT_TEMPERATURE
-    private var configuredBackendPreference = BackendPreference.AUTO
+    private var configuredRuntimeConfig = RuntimeConfig()
 
     /**
      * Single-threaded coroutine dispatcher & scope for LLama asynchronous operations
@@ -230,31 +254,31 @@ internal class InferenceEngineImpl private constructor(
             }
         }
 
-    override suspend fun setRuntimeConfig(
-        threads: Int,
-        temperature: Float,
-        backendPreference: BackendPreference,
-    ) =
+    override suspend fun setRuntimeConfig(config: RuntimeConfig) =
         withContext(llamaDispatcher) {
-            require(threads in MIN_THREADS..MAX_THREADS) { "Thread count must be $MIN_THREADS..$MAX_THREADS" }
-            require(temperature in MIN_TEMPERATURE..MAX_TEMPERATURE) { "Temperature must be 0.0..2.0" }
             check(_state.value is InferenceEngine.State.Initialized) {
                 "Unload the model before changing the runtime configuration"
             }
-            setNativeRuntimeConfig(threads, temperature, backendPreference.nativeValue)
-            configuredThreads = threads
-            configuredTemperature = temperature
-            configuredBackendPreference = backendPreference
+            setNativeRuntimeConfig(
+                config.threads,
+                config.temperature,
+                config.backendPreference.nativeValue,
+                config.flashAttention.nativeValue,
+                config.kvCacheType.nativeValue,
+                config.batchSize,
+                config.ubatchSize,
+            )
+            configuredRuntimeConfig = config
         }
 
     override fun runtimeInfo() = RuntimeInfo(
-        configuredThreads = configuredThreads,
-        temperature = configuredTemperature,
+        configuredThreads = configuredRuntimeConfig.threads,
+        temperature = configuredRuntimeConfig.temperature,
         backend = runtimeBackend(),
         systemInfo = systemInfo(),
         peakMemoryKb = peakMemoryKb(),
         backendProfile = runtimeBackendProfile(),
-        backendPreference = configuredBackendPreference,
+        backendPreference = configuredRuntimeConfig.backendPreference,
         requestedDevice = runtimeRequestedDevice(),
         activeDevice = runtimeActiveDevice(),
         registeredBackends = runtimeRegisteredBackends(),
@@ -263,6 +287,17 @@ internal class InferenceEngineImpl private constructor(
         fallbackReason = runtimeFallbackReason().ifBlank { null },
         batchSize = runtimeBatchSize(),
         ubatchSize = runtimeUbatchSize(),
+        flashAttention = FlashAttentionMode.values().firstOrNull { it.nativeValue == runtimeFlashAttention() }
+            ?: configuredRuntimeConfig.flashAttention,
+        kvCacheType = KvCacheType.values().firstOrNull { it.nativeValue == runtimeKvCacheType() }
+            ?: configuredRuntimeConfig.kvCacheType,
+        timing = RuntimeTiming(
+            modelLoadMs = runtimeModelLoadMs(),
+            contextInitMs = runtimeContextInitMs(),
+            systemPrefillMs = runtimeSystemPrefillMs(),
+            promptPrefillMs = runtimePromptPrefillMs(),
+            nativeDecodeMs = runtimeNativeDecodeMs(),
+        ),
     )
 
     /**
@@ -270,9 +305,9 @@ internal class InferenceEngineImpl private constructor(
      *
      * TODO-han.yin: return error code if system prompt not correct processed?
      */
-    override suspend fun setSystemPrompt(prompt: String) =
+    override suspend fun setSystemPrompt(systemPrompt: String) =
         withContext(llamaDispatcher) {
-            require(prompt.isNotBlank()) { "Cannot process empty system prompt!" }
+            require(systemPrompt.isNotBlank()) { "Cannot process empty system prompt!" }
             check(_readyForSystemPrompt) { "System prompt must be set ** RIGHT AFTER ** model loaded!" }
             check(_state.value is InferenceEngine.State.ModelReady) {
                 "Cannot process system prompt in ${_state.value.javaClass.simpleName}!"
@@ -281,7 +316,7 @@ internal class InferenceEngineImpl private constructor(
             Log.i(TAG, "Sending system prompt...")
             _readyForSystemPrompt = false
             _state.value = InferenceEngine.State.ProcessingSystemPrompt
-            processSystemPrompt(prompt).let { result ->
+            processSystemPrompt(systemPrompt).let { result ->
                 if (result != 0) {
                     RuntimeException("Failed to process system prompt: $result").also {
                         _state.value = InferenceEngine.State.Error(it)

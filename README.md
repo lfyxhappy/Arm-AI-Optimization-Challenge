@@ -11,6 +11,8 @@ The app extends the official `llama.cpp` Android sample with functionality that 
 - TTFT, output token count, UI-streaming tokens/s, process `VmHWM`, Android thermal state, battery temperature, and available battery current.
 - Auto tuning: each thread setting receives one warm-up plus five measured runs. A run at `THERMAL_STATUS_SEVERE` or above is exported as invalid and excluded from the recommendation.
 - Each auto-tune action starts a fresh benchmark session. Interactive chat and stopped-generation measurements remain separate, so they cannot affect the exported benchmark, recommendation, or comparison report.
+- Context experiment controls: Flash Attention policy, shared F16/Q8_0/Q4_0 KV-cache type, and `batch`/`ubatch` are applied before model loading and recorded with every run. Quantized KV-cache experiments require Flash Attention to be `Auto` or `On`.
+- Each formal auto-tune stage is automatically archived as immutable JSON, CSV, and HTML in app-private storage. The app can export the current stage or a cumulative all-stage CSV, so a later experiment cannot overwrite its baseline.
 - In each APK, a runtime selector records the compiled profile, CPU/accelerator preference, requested and active device, registered backends/devices, observed layer offload, fallback reason, and batch settings. These fields are included in JSON, CSV, and HTML exports.
 - One-click JSON, CSV, and `Baseline vs Optimized` HTML exports.
 
@@ -77,6 +79,14 @@ Download source weights only from the model publisher and accept its licence bef
 The app fixes the Chinese benchmark prompt, system prompt, temperature, and maximum output tokens while it tests 2, 4, 6, and 8 threads. For each setting it executes one warm-up and five measured runs. The recommendation first maximizes the mean valid tokens/s and then minimizes mean TTFT. Full details and reporting fields are in [docs/benchmark-protocol.md](docs/benchmark-protocol.md).
 
 Use a physical OnePlus 13 for submission numbers. Emulator results and a successful build do not validate Arm performance or thermals.
+
+After every completed stage, pull the app-private archive before changing configuration or reinstalling the debug app:
+
+```powershell
+./tools/pull-benchmark-stages.ps1 -Serial <adb-serial>
+```
+
+The helper writes a timestamped directory with all stage JSON/CSV/HTML files and a SHA-256 manifest under ignored `benchmarks/output/` storage.
 
 ## Verified CPU Result
 
