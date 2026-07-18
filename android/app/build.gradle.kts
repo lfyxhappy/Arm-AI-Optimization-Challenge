@@ -17,6 +17,10 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // The public reviewer APK targets the Arm64 physical-device path only.
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
         vectorDrawables {
             useSupportLibrary = true
         }
