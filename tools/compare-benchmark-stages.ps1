@@ -267,9 +267,15 @@ foreach ($file in $candidateFiles) {
     if ($schema -notmatch "^arm-mobile-ai-benchmark/v[123]$") { continue }
 
     $session = Get-PropertyValue -Object $document -Name "session" -Default $null
+    $measurements = Get-PropertyValue -Object $document -Name "measurements" -Default $null
+    # The output root also contains evidence summaries that may repeat the
+    # benchmark schema as a reference. Only formal archive documents have a
+    # measurements payload and, for v2/v3, a formal session object.
+    if ($null -eq $measurements) { continue }
     $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     $legacy = $schema -eq "arm-mobile-ai-benchmark/v1"
     if ($legacy) { $session = New-LegacySession -Document $document -SourceFile $file -SourceSha256 $sourceHash }
+    if (-not $legacy -and $null -eq $session) { continue }
     $sessionId = Get-TextValue -Object $session -Name "id"
     if ([string]::IsNullOrWhiteSpace($sessionId)) { throw "Benchmark archive is missing session.id: $($file.FullName)" }
     $rawArtifacts.Add([pscustomobject]@{

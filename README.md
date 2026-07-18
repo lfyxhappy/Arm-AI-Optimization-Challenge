@@ -106,6 +106,10 @@ On 2026-07-18, the CPU Debug APK was measured on a OnePlus 13 with the verified 
 
 The 8-thread block reached `THERMAL_STATUS_SEVERE` and is retained only as invalid telemetry, not as a performance comparison. See [the full OnePlus result record](docs/oneplus13-cpu-q4-results-20260718.md) for hashes, device fingerprint, memory evidence, and limitations.
 
+## Initial KV-Cache Result
+
+On the same OnePlus 13, an initial Flash Attention + Q8_0 KV-cache experiment used the same Q4 model, prompt fingerprints, token limit, APK, and CPU profile as its F16 KV reference. The fully valid 2-thread and 4-thread rows improved generation throughput by 22.85% and 3.81% respectively, while the Q8 run reduced post-run PSS by 8.37%. The F16 6-thread group had only three valid samples, so the observed 6-thread difference is not presented as a performance winner. See [the complete controlled-input record](docs/oneplus13-flash-q8-kv-results-20260718.md).
+
 ## Third-Party Attribution
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp), MIT. Fixed upstream commit: `e8f19cc0ad70a243c8012bf17b4be601abfc8ea2`.
