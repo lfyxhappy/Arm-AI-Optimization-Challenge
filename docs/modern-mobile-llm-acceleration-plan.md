@@ -13,6 +13,7 @@ Status: The CPU Debug path has a real OnePlus 13 Q4 baseline and corrected peak-
 - [x] Pass the CPU Debug regression build with the pinned CPU/KleidiAI/OpenMP path; invalid profile, missing OpenCL SDK, and missing Hexagon SDK fail early with actionable errors.
 - [x] Capture a real OnePlus 13 CPU Q4 benchmark with 24 records, valid-only aggregation, thermal invalidation, JSON/CSV/HTML exports, and non-zero `VmHWM` for executed runs.
 - [x] Add CPU experiment controls for Flash Attention, F16/Q8_0/Q4_0 KV cache, and `batch`/`ubatch`; record split native timings and archive every auto-tune stage without overwriting earlier samples.
+- [x] Add controlled-input fingerprints and a host-side de-duplicated stage comparison report with source SHA-256 manifests, so baseline and optimized sessions can be audited without exporting prompt contents.
 - [ ] Validate Flash Attention/KV cache combinations with deterministic Chinese smoke prompts and repeated OnePlus measurements before claiming an improvement.
 - [ ] Build and inspect a real OpenCL APK after the Qualcomm SDK is installed.
 - [ ] Build, package-inspect, and quality-gate a real HTP APK after the Hexagon SDK is installed.

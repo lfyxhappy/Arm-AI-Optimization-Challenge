@@ -332,26 +332,27 @@ class MainActivity : AppCompatActivity() {
         val sessionStartedAt = Instant.now().toString()
         val benchmarkSystemPrompt = systemPrompt.text.toString().ifBlank { DEFAULT_SYSTEM_PROMPT }
         val benchmarkMaxTokens = selectedMaxTokens()
+        val benchmarkPrompt = BENCHMARK_PROMPT
+        val benchmarkInputs = BenchmarkInputs.from(benchmarkSystemPrompt, benchmarkPrompt, benchmarkMaxTokens)
         benchmarkMeasurements.clear()
         setBusy(true, "Auto tuning $stage: 1 warm-up + 5 measured runs per thread count...")
         lifecycleScope.launch(Dispatchers.Default) {
             try {
-                val prompt = BENCHMARK_PROMPT
                 for (threadCount in THREAD_CANDIDATES) {
                     statusOnMain("Warm-up at $threadCount threads")
                     benchmarkMeasurements += runBenchmark(
-                        model, threadCount, config, prompt, benchmarkSystemPrompt, benchmarkMaxTokens,
+                        model, threadCount, config, benchmarkPrompt, benchmarkSystemPrompt, benchmarkMaxTokens,
                         sessionId, stage, warmup = true,
                     )
                     repeat(MEASURED_RUNS) { index ->
                         statusOnMain("Measuring $threadCount threads: ${index + 1}/$MEASURED_RUNS")
                         benchmarkMeasurements += runBenchmark(
-                            model, threadCount, config, prompt, benchmarkSystemPrompt, benchmarkMaxTokens,
+                            model, threadCount, config, benchmarkPrompt, benchmarkSystemPrompt, benchmarkMaxTokens,
                             sessionId, stage, warmup = false,
                         )
                     }
                 }
-                val archive = archiveBenchmarkSession(stage, config, sessionStartedAt, sessionId, complete = true)
+                val archive = archiveBenchmarkSession(stage, config, benchmarkInputs, sessionStartedAt, sessionId, complete = true)
                 val best = BenchmarkExporter.recommended(benchmarkMeasurements)
                 statusOnMain(best?.let {
                     "Archived $stage (${archive.sessionCount} stages). Recommended: ${it.threads} threads (${it.meanTokensPerSecond.format(2)} mean tokens/s)"
@@ -362,7 +363,7 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 if (benchmarkMeasurements.isNotEmpty() && currentBenchmarkSession?.id != sessionId) {
                     runCatching {
-                        archiveBenchmarkSession(stage, config, sessionStartedAt, sessionId, complete = false)
+                        archiveBenchmarkSession(stage, config, benchmarkInputs, sessionStartedAt, sessionId, complete = false)
                     }.onSuccess {
                         withContext(Dispatchers.Main) { refreshArchiveStatus() }
                     }
@@ -375,6 +376,7 @@ class MainActivity : AppCompatActivity() {
     private fun archiveBenchmarkSession(
         stage: String,
         config: RuntimeConfig,
+        inputs: BenchmarkInputs,
         startedAt: String,
         sessionId: String,
         complete: Boolean,
@@ -383,6 +385,7 @@ class MainActivity : AppCompatActivity() {
             this,
             stage,
             config,
+            inputs,
             benchmarkMeasurements.toList(),
             complete,
             startedAt,
@@ -740,7 +743,7 @@ internal object BenchmarkExporter {
     private fun baseline(items: List<BenchmarkMeasurement>) = summaries(items).firstOrNull()
 
     fun json(session: BenchmarkSession?, items: List<BenchmarkMeasurement>) = buildString {
-        append("{\n  \"schema\": \"arm-mobile-ai-benchmark/v2\",")
+        append("{\n  \"schema\": \"arm-mobile-ai-benchmark/v3\",")
         if (session != null) append("\n  \"session\": {").append(session.json()).append("},")
         append("\n  \"measurements\": [\n")
         items.forEachIndexed { index, value ->
@@ -750,14 +753,18 @@ internal object BenchmarkExporter {
         append("  ]\n}\n")
     }
 
-    fun csvHeader() = "session_id,stage,session_complete,timestamp,model,sha256,model_bytes,threads,temperature,output_tokens,ttft_ms,end_to_end_ms,tokens_per_second,peak_memory_kb,backend,backend_profile,backend_preference,requested_device,active_device,registered_backends,registered_devices,layer_offload,fallback_reason,batch_size,ubatch_size,flash_attention,kv_cache_type,model_load_ms,context_init_ms,system_prefill_ms,prompt_prefill_ms,native_decode_ms,thermal_status,battery_temperature_c,battery_current_ua,valid,warmup,invalid_reason\n"
+    fun csvHeader() = "session_id,stage,session_complete,input_protocol,input_system_prompt_sha256,input_system_prompt_utf8_bytes,input_user_prompt_sha256,input_user_prompt_utf8_bytes,input_max_output_tokens,timestamp,model,sha256,model_bytes,threads,temperature,output_tokens,ttft_ms,end_to_end_ms,tokens_per_second,peak_memory_kb,backend,backend_profile,backend_preference,requested_device,active_device,registered_backends,registered_devices,layer_offload,fallback_reason,batch_size,ubatch_size,flash_attention,kv_cache_type,model_load_ms,context_init_ms,system_prefill_ms,prompt_prefill_ms,native_decode_ms,thermal_status,battery_temperature_c,battery_current_ua,valid,warmup,invalid_reason\n"
 
-    fun csv(session: BenchmarkSession, items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(items, session.complete)
+    fun csv(session: BenchmarkSession, items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(items, session.complete, session.inputs)
 
     fun csv(items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(items)
 
-    fun csvRows(items: List<BenchmarkMeasurement>, sessionComplete: Boolean? = null) = buildString {
-        items.forEach { append(it.csv(sessionComplete)).append('\n') }
+    fun csvRows(
+        items: List<BenchmarkMeasurement>,
+        sessionComplete: Boolean? = null,
+        inputs: BenchmarkInputs? = null,
+    ) = buildString {
+        items.forEach { append(it.csv(sessionComplete, inputs)).append('\n') }
     }
 
     fun report(session: BenchmarkSession?, items: List<BenchmarkMeasurement>): String {
@@ -774,9 +781,13 @@ internal object BenchmarkExporter {
                 append("<h2>Reproducibility</h2><table><tr><th>Session</th><td>").append(html(session.id)).append("</td></tr>")
                 append("<tr><th>Started</th><td>").append(html(session.startedAt)).append("</td></tr>")
                 append("<tr><th>Stage status</th><td>").append(if (session.complete) "completed" else "partial").append("</td></tr>")
-                append("<tr><th>App / ABI</th><td>").append(html(session.appVersion)).append(" / ").append(html(session.abi)).append("</td></tr>")
+                append("<tr><th>App / ABI / APK SHA-256</th><td>").append(html(session.appVersion)).append(" / ").append(html(session.abi)).append(" / ").append(html(session.appApkSha256)).append("</td></tr>")
                 append("<tr><th>Flash / KV / batch</th><td>").append(html(config!!.flashAttention.name)).append(" / ")
                 append(html(config.kvCacheType.name)).append(" / ").append(config.batchSize).append(" / ").append(config.ubatchSize).append("</td></tr></table>")
+                append("<h2>Input fingerprint</h2><table><tr><th>Protocol</th><td>").append(html(session.inputs.protocol)).append("</td></tr>")
+                append("<tr><th>System prompt SHA-256 / bytes</th><td>").append(html(session.inputs.systemPromptSha256)).append(" / ").append(session.inputs.systemPromptUtf8Bytes).append("</td></tr>")
+                append("<tr><th>User prompt SHA-256 / bytes</th><td>").append(html(session.inputs.userPromptSha256)).append(" / ").append(session.inputs.userPromptUtf8Bytes).append("</td></tr>")
+                append("<tr><th>Maximum output tokens</th><td>").append(session.inputs.maxOutputTokens).append("</td></tr></table>")
             }
             append("<h2>Baseline vs Optimized</h2><table><tr><th>Configuration</th><th>Threads</th><th>Valid runs</th><th>Mean TTFT (ms)</th><th>Mean tokens/s</th><th>Peak memory max (KB)</th></tr>")
             append(summaryRow("Baseline", baseline)).append(summaryRow("Optimized", optimized)).append("</table>")
@@ -797,12 +808,17 @@ internal object BenchmarkExporter {
 
     private fun runtimeRow(label: String, value: BenchmarkMeasurement?): String = "<tr><td>${html(label)}</td><td>${html(value?.backendProfile ?: "n/a")}</td><td>${html(value?.requestedDevice ?: "n/a")} / ${html(value?.activeDevice ?: "n/a")}</td><td>${html(value?.flashAttention ?: "n/a")} / ${html(value?.kvCacheType ?: "n/a")}</td><td>${html(value?.layerOffload ?: "n/a")}</td><td>${html(value?.fallbackReason ?: "none")}</td></tr>"
 
-    private fun BenchmarkSession.json() = "\"id\":\"${escape(id)}\",\"stage\":\"${escape(stage)}\",\"startedAt\":\"${escape(startedAt)}\",\"complete\":$complete,\"appVersion\":\"${escape(appVersion)}\",\"deviceFingerprint\":\"${escape(deviceFingerprint)}\",\"abi\":\"${escape(abi)}\",\"runtimeConfig\":{\"threads\":${config.threads},\"temperature\":${config.temperature},\"backendPreference\":\"${escape(config.backendPreference.name.lowercase())}\",\"flashAttention\":\"${escape(config.flashAttention.name.lowercase())}\",\"kvCacheType\":\"${escape(config.kvCacheType.name.lowercase())}\",\"batchSize\":${config.batchSize},\"ubatchSize\":${config.ubatchSize}}"
+    private fun BenchmarkSession.json() = "\"id\":\"${escape(id)}\",\"stage\":\"${escape(stage)}\",\"startedAt\":\"${escape(startedAt)}\",\"complete\":$complete,\"appVersion\":\"${escape(appVersion)}\",\"appApkSha256\":\"${escape(appApkSha256)}\",\"deviceFingerprint\":\"${escape(deviceFingerprint)}\",\"abi\":\"${escape(abi)}\",\"runtimeConfig\":{\"threads\":${config.threads},\"temperature\":${config.temperature},\"backendPreference\":\"${escape(config.backendPreference.name.lowercase())}\",\"flashAttention\":\"${escape(config.flashAttention.name.lowercase())}\",\"kvCacheType\":\"${escape(config.kvCacheType.name.lowercase())}\",\"batchSize\":${config.batchSize},\"ubatchSize\":${config.ubatchSize}},\"inputs\":{${inputs.json()}}"
+
+    private fun BenchmarkInputs.json() = "\"protocol\":\"${escape(protocol)}\",\"systemPromptSha256\":\"${escape(systemPromptSha256)}\",\"systemPromptUtf8Bytes\":$systemPromptUtf8Bytes,\"userPromptSha256\":\"${escape(userPromptSha256)}\",\"userPromptUtf8Bytes\":$userPromptUtf8Bytes,\"maxOutputTokens\":$maxOutputTokens"
 
     private fun BenchmarkMeasurement.json() = "\"sessionId\":\"${escape(sessionId)}\",\"stage\":\"${escape(stage)}\",\"timestamp\":\"${escape(timestamp)}\",\"model\":\"${escape(modelName)}\",\"sha256\":\"$modelSha256\",\"modelBytes\":$modelBytes,\"threads\":$threads,\"temperature\":$temperature,\"outputTokens\":$outputTokens,\"ttftMs\":$ttftMs,\"endToEndMs\":$elapsedMs,\"tokensPerSecond\":$tokensPerSecond,\"peakMemoryKb\":$peakMemoryKb,\"backend\":\"${escape(backend)}\",\"backendProfile\":\"${escape(backendProfile)}\",\"backendPreference\":\"${escape(backendPreference)}\",\"requestedDevice\":\"${escape(requestedDevice)}\",\"activeDevice\":\"${escape(activeDevice)}\",\"registeredBackends\":\"${escape(registeredBackends)}\",\"registeredDevices\":\"${escape(registeredDevices)}\",\"layerOffload\":\"${escape(layerOffload)}\",\"fallbackReason\":${fallbackReason?.let { "\"${escape(it)}\"" } ?: "null"},\"batchSize\":$batchSize,\"ubatchSize\":$ubatchSize,\"flashAttention\":\"${escape(flashAttention)}\",\"kvCacheType\":\"${escape(kvCacheType)}\",\"modelLoadMs\":$modelLoadMs,\"contextInitMs\":$contextInitMs,\"systemPrefillMs\":$systemPrefillMs,\"promptPrefillMs\":$promptPrefillMs,\"nativeDecodeMs\":$nativeDecodeMs,\"thermalStatus\":$thermalStatus,\"batteryTemperatureC\":${batteryTemperatureC ?: "null"},\"batteryCurrentUa\":${batteryCurrentUa ?: "null"},\"valid\":$valid,\"warmup\":$warmup,\"invalidReason\":${invalidReason?.let { "\"${escape(it)}\"" } ?: "null"}"
 
-    private fun BenchmarkMeasurement.csv(sessionComplete: Boolean?) = listOf(
-        sessionId, stage, sessionComplete, timestamp, modelName, modelSha256, modelBytes, threads, temperature, outputTokens,
+    private fun BenchmarkMeasurement.csv(sessionComplete: Boolean?, inputs: BenchmarkInputs?) = listOf(
+        sessionId, stage, sessionComplete,
+        inputs?.protocol, inputs?.systemPromptSha256, inputs?.systemPromptUtf8Bytes,
+        inputs?.userPromptSha256, inputs?.userPromptUtf8Bytes, inputs?.maxOutputTokens,
+        timestamp, modelName, modelSha256, modelBytes, threads, temperature, outputTokens,
         ttftMs, elapsedMs, tokensPerSecond, peakMemoryKb, backend, backendProfile, backendPreference,
         requestedDevice, activeDevice, registeredBackends, registeredDevices, layerOffload, fallbackReason,
         batchSize, ubatchSize, flashAttention, kvCacheType, modelLoadMs, contextInitMs, systemPrefillMs,

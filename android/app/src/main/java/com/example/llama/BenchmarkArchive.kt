@@ -4,8 +4,45 @@ import android.content.Context
 import android.os.Build
 import com.arm.aichat.RuntimeConfig
 import java.io.File
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
+
+/**
+ * Privacy-preserving identity for the controlled inputs of a formal stage.
+ * The prompt contents stay on-device; their UTF-8 SHA-256 values make a later
+ * cross-stage comparison auditable without exporting the prompt text itself.
+ */
+internal data class BenchmarkInputs(
+    val protocol: String,
+    val systemPromptSha256: String,
+    val systemPromptUtf8Bytes: Int,
+    val userPromptSha256: String,
+    val userPromptUtf8Bytes: Int,
+    val maxOutputTokens: Int,
+) {
+    companion object {
+        const val PROTOCOL = "fixed-prompt-v1"
+
+        fun from(systemPrompt: String, userPrompt: String, maxOutputTokens: Int): BenchmarkInputs {
+            require(maxOutputTokens > 0) { "Maximum output tokens must be positive" }
+            val systemBytes = systemPrompt.toByteArray(Charsets.UTF_8)
+            val userBytes = userPrompt.toByteArray(Charsets.UTF_8)
+            return BenchmarkInputs(
+                protocol = PROTOCOL,
+                systemPromptSha256 = sha256(systemBytes),
+                systemPromptUtf8Bytes = systemBytes.size,
+                userPromptSha256 = sha256(userBytes),
+                userPromptUtf8Bytes = userBytes.size,
+                maxOutputTokens = maxOutputTokens,
+            )
+        }
+
+        private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+}
 
 /** Immutable metadata attached to one formal auto-tune run. */
 internal data class BenchmarkSession(
@@ -13,9 +50,11 @@ internal data class BenchmarkSession(
     val stage: String,
     val startedAt: String,
     val appVersion: String,
+    val appApkSha256: String,
     val deviceFingerprint: String,
     val abi: String,
     val config: RuntimeConfig,
+    val inputs: BenchmarkInputs,
     val complete: Boolean,
     val measurements: List<BenchmarkMeasurement>,
 )
@@ -49,7 +88,7 @@ internal class BenchmarkArchiveStore(private val context: Context) {
         atomicWrite(html, BenchmarkExporter.report(session, session.measurements))
 
         val existing = if (historyCsv.isFile) historyCsv.readText() else BenchmarkExporter.csvHeader()
-        atomicWrite(historyCsv, existing + BenchmarkExporter.csvRows(session.measurements, session.complete))
+        atomicWrite(historyCsv, existing + BenchmarkExporter.csvRows(session.measurements, session.complete, session.inputs))
         return BenchmarkArchiveResult(json, csv, html, sessionCount())
     }
 
@@ -62,6 +101,7 @@ internal class BenchmarkArchiveStore(private val context: Context) {
             context: Context,
             stage: String,
             config: RuntimeConfig,
+            inputs: BenchmarkInputs,
             measurements: List<BenchmarkMeasurement>,
             complete: Boolean,
             startedAt: String = Instant.now().toString(),
@@ -71,9 +111,11 @@ internal class BenchmarkArchiveStore(private val context: Context) {
             stage = stage,
             startedAt = startedAt,
             appVersion = appVersion(context),
+            appApkSha256 = apkSha256(context),
             deviceFingerprint = Build.FINGERPRINT,
             abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
             config = config,
+            inputs = inputs,
             complete = complete,
             measurements = measurements,
         )
@@ -82,6 +124,19 @@ internal class BenchmarkArchiveStore(private val context: Context) {
             @Suppress("DEPRECATION")
             context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
         }.getOrDefault("unknown")
+
+        private fun apkSha256(context: Context): String = runCatching {
+            val digest = MessageDigest.getInstance("SHA-256")
+            File(context.applicationInfo.sourceDir).inputStream().use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        }.getOrDefault("unavailable")
 
         private fun timestampSlug(value: String) = value
             .replace(Regex("[^0-9A-Za-z]+"), "-")

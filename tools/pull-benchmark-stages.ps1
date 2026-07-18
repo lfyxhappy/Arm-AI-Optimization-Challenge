@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Serial,
     [string]$Package = "com.lfyxhappy.armai",
-    [string]$OutputRoot = (Join-Path $PSScriptRoot "..\benchmarks\output")
+    [string]$OutputRoot = (Join-Path $PSScriptRoot "..\benchmarks\output"),
+    [switch]$SkipComparison
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,3 +91,11 @@ $manifestPath = Join-Path $destination "manifest.json"
 @($manifest) | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 Write-Output "Copied $(@($manifest).Count) benchmark archive files to $destination"
 Write-Output "Manifest: $manifestPath"
+
+if (-not $SkipComparison) {
+    $comparisonScript = Join-Path $PSScriptRoot "compare-benchmark-stages.ps1"
+    if (-not (Test-Path -LiteralPath $comparisonScript)) {
+        throw "Stage comparison helper was not found: $comparisonScript"
+    }
+    & $comparisonScript -InputRoot (Resolve-Path $OutputRoot).Path
+}

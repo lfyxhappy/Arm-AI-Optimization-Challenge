@@ -4,6 +4,8 @@
 
 Use the same GGUF, Chinese prompt, system prompt, temperature, maximum output length, Android build, and device state for every compared configuration. The app's default candidate thread counts are `2`, `4`, `6`, and `8`. Record the compiled backend profile and runtime preference (`auto`, `cpu`, or `accelerator`) as controlled inputs too.
 
+Every new formal archive uses schema `arm-mobile-ai-benchmark/v3` and retains the SHA-256 plus UTF-8 byte length of the system prompt and benchmark prompt, the prompt protocol label, and maximum output tokens. Prompt text is deliberately not exported. This gives the host comparison tool enough evidence to reject an accidental prompt mismatch without leaking the prompt itself. Existing v1/v2 archives remain valid historical evidence, but are labelled `legacy-inputs-missing` rather than silently mixed into controlled cross-stage conclusions.
+
 Each experiment must have a human-readable stage name, such as `cpu-q4-baseline`, `cpu-q4-fa-on-f16-kv`, or `cpu-q4-fa-on-q8-kv`. A stage changes exactly one hypothesis at a time whenever possible. Flash Attention policy, KV cache type, `batch`, and `ubatch` are first-class controlled inputs, not informal notes.
 
 ## Run sequence
@@ -28,8 +30,12 @@ From valid, non-warm-up results, the selected thread count maximizes mean tokens
 
 1. Run the protocol for Base F16, Q8_0, and Q4_K_M GGUF artifacts.
 2. The app automatically archives every completed or partially completed auto-tune session as immutable JSON, CSV, and HTML files in app-private `benchmark-stages/` storage. A partial archive is explicitly marked `complete=false` and must not be compared as a full 24-slot stage. Export the all-stage CSV and preserve it under an ignored local artifact directory.
-3. Build a result table from only valid samples, with model SHA-256, device build, and app version.
+3. Build a result table from only valid samples, with model SHA-256, device build, app version, and installed APK SHA-256.
 4. Run Qwen3-4B Instruct Q4_K_M through the chat screen as a Chinese smoke test.
-5. Preserve `backendProfile`, preference, requested/active device, registered backends/devices, layer offload, fallback reason, Flash Attention policy, KV cache type, batch, ubatch, and stage/session identifiers beside every exported measurement.
+5. Preserve `backendProfile`, preference, requested/active device, registered backends/devices, layer offload, fallback reason, Flash Attention policy, KV cache type, batch, ubatch, controlled-input fingerprints, and stage/session identifiers beside every exported measurement.
 
-Use `tools/pull-benchmark-stages.ps1 -Serial <adb-serial>` after each stage to copy the app-private archive into a timestamped ignored `benchmarks/output/` directory with a SHA-256 manifest. This is required before reinstalling or clearing the debug app because app-private archives are otherwise device-local.
+Use `tools/pull-benchmark-stages.ps1 -Serial <adb-serial>` after each stage to copy the app-private archive into a timestamped ignored `benchmarks/output/` directory with a SHA-256 manifest. This is required before reinstalling or clearing the debug app because app-private archives are otherwise device-local. The pull helper then creates an immutable comparison directory containing a de-duplicated cross-stage CSV, HTML report, and source SHA-256 manifest. To calculate relative values against a named stage without changing any raw data, run:
+
+```powershell
+./tools/compare-benchmark-stages.ps1 -BaselineStage cpu-q4-fa-auto-f16
+```

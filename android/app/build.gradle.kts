@@ -57,6 +57,7 @@ dependencies {
     implementation(project(":lib"))
 
     testImplementation(libs.junit)
+    testImplementation("com.google.code.gson:gson:2.11.0")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }

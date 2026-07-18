@@ -3,7 +3,9 @@ package com.lfyxhappy.armai
 import com.arm.aichat.FlashAttentionMode
 import com.arm.aichat.KvCacheType
 import com.arm.aichat.RuntimeConfig
+import com.google.gson.JsonParser
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -52,9 +54,11 @@ class BenchmarkExporterTest {
             stage = "cpu-q4-fa-on-q8-kv",
             startedAt = "2026-07-18T00:00:00Z",
             appVersion = "0.1.0",
+            appApkSha256 = "apk-sha",
             deviceFingerprint = "test-device",
             abi = "arm64-v8a",
             config = config,
+            inputs = BenchmarkInputs.from("system", "user", 96),
             complete = true,
             measurements = listOf(measurement(6, 12.0, 900.0, 9_100_000)),
         )
@@ -63,15 +67,57 @@ class BenchmarkExporterTest {
         val csv = BenchmarkExporter.csv(session, session.measurements)
         val report = BenchmarkExporter.report(session, session.measurements)
 
-        assertTrue(json.contains("arm-mobile-ai-benchmark/v2"))
+        assertTrue(json.contains("arm-mobile-ai-benchmark/v3"))
         assertTrue(json.contains("cpu-q4-fa-on-q8-kv"))
         assertTrue(json.contains("\"flashAttention\":\"enabled\""))
         assertTrue(json.contains("\"kvCacheType\":\"q8_0\""))
+        assertTrue(json.contains("\"protocol\":\"fixed-prompt-v1\""))
         assertTrue(json.contains("\"complete\":true"))
+        assertTrue(json.contains("\"appApkSha256\":\"apk-sha\""))
         assertTrue(csv.contains("native_decode_ms"))
+        assertTrue(csv.contains("input_user_prompt_sha256"))
         assertTrue(csv.contains("\"true\""))
         assertTrue(report.contains("Flash / KV / batch"))
+        assertTrue(report.contains("Input fingerprint"))
         assertTrue(report.contains("Split Timing"))
+    }
+
+    @Test
+    fun inputFingerprintChangesWhenAControlledInputChanges() {
+        val base = BenchmarkInputs.from("system", "user", 96)
+        val changedPrompt = BenchmarkInputs.from("system", "different user", 96)
+        val changedLimit = BenchmarkInputs.from("system", "user", 128)
+
+        assertEquals(base.systemPromptSha256, changedPrompt.systemPromptSha256)
+        assertNotEquals(base.userPromptSha256, changedPrompt.userPromptSha256)
+        assertNotEquals(base.maxOutputTokens, changedLimit.maxOutputTokens)
+    }
+
+    @Test
+    fun stageJsonKeepsStructuredInputFingerprint() {
+        val inputs = BenchmarkInputs.from("system", "user", 96)
+        val session = BenchmarkSession(
+            id = "session-json",
+            stage = "cpu-q4-fa-auto-f16",
+            startedAt = "2026-07-18T00:00:00Z",
+            appVersion = "0.1.0",
+            appApkSha256 = "apk-sha-json",
+            deviceFingerprint = "test-device",
+            abi = "arm64-v8a",
+            config = RuntimeConfig(),
+            inputs = inputs,
+            complete = true,
+            measurements = listOf(measurement(4, 10.0, 800.0, 8_000_000)),
+        )
+
+        val document = JsonParser.parseString(BenchmarkExporter.json(session, session.measurements)).asJsonObject
+        val exportedInputs = document.getAsJsonObject("session").getAsJsonObject("inputs")
+
+        assertEquals(BenchmarkInputs.PROTOCOL, exportedInputs.get("protocol").asString)
+        assertEquals(inputs.systemPromptSha256, exportedInputs.get("systemPromptSha256").asString)
+        assertEquals(inputs.userPromptSha256, exportedInputs.get("userPromptSha256").asString)
+        assertEquals(96, exportedInputs.get("maxOutputTokens").asInt)
+        assertEquals("apk-sha-json", document.getAsJsonObject("session").get("appApkSha256").asString)
     }
 
     @Test(expected = IllegalArgumentException::class)

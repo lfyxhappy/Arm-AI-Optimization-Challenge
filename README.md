@@ -12,8 +12,8 @@ The app extends the official `llama.cpp` Android sample with functionality that 
 - Auto tuning: each thread setting receives one warm-up plus five measured runs. A run at `THERMAL_STATUS_SEVERE` or above is exported as invalid and excluded from the recommendation.
 - Each auto-tune action starts a fresh benchmark session. Interactive chat and stopped-generation measurements remain separate, so they cannot affect the exported benchmark, recommendation, or comparison report.
 - Context experiment controls: Flash Attention policy, shared F16/Q8_0/Q4_0 KV-cache type, and `batch`/`ubatch` are applied before model loading and recorded with every run. Quantized KV-cache experiments require Flash Attention to be `Auto` or `On`.
-- Each formal auto-tune stage is automatically archived as immutable JSON, CSV, and HTML in app-private storage. The app can export the current stage or a cumulative all-stage CSV, so a later experiment cannot overwrite its baseline.
-- In each APK, a runtime selector records the compiled profile, CPU/accelerator preference, requested and active device, registered backends/devices, observed layer offload, fallback reason, and batch settings. These fields are included in JSON, CSV, and HTML exports.
+- Each formal auto-tune stage is automatically archived as immutable JSON, CSV, and HTML in app-private storage. It includes privacy-preserving system/user prompt SHA-256 fingerprints, UTF-8 byte counts, and maximum output tokens, so cross-stage comparisons can verify controlled inputs without exporting prompt text.
+- In each APK, a runtime selector records the compiled profile, CPU/accelerator preference, requested and active device, registered backends/devices, observed layer offload, fallback reason, and batch settings. Formal archives also record the installed APK SHA-256, so a result points to the exact binary even when the version name is unchanged. These fields are included in JSON, CSV, and HTML exports.
 - One-click JSON, CSV, and `Baseline vs Optimized` HTML exports.
 
 ## Scope
@@ -87,6 +87,12 @@ After every completed stage, pull the app-private archive before changing config
 ```
 
 The helper writes a timestamped directory with all stage JSON/CSV/HTML files and a SHA-256 manifest under ignored `benchmarks/output/` storage.
+
+It also produces a timestamped de-duplicated comparison CSV, HTML report, and source manifest. To calculate percentage deltas against one named baseline stage while retaining every raw archive unchanged:
+
+```powershell
+./tools/compare-benchmark-stages.ps1 -BaselineStage cpu-q4-fa-auto-f16
+```
 
 ## Verified CPU Result
 
