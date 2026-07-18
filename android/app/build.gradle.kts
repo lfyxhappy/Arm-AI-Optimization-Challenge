@@ -43,6 +43,16 @@ android {
                 "proguard-rules.pro"
             )
         }
+        // A reproducible evaluator build: optimized like release, but signed
+        // with the standard Android debug certificate so no private key is
+        // required in this repository or CI. It is never a production build.
+        create("reviewer") {
+            initWith(getByName("release"))
+            matchingFallbacks += listOf("release")
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
+            versionNameSuffix = "-reviewer"
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -67,6 +67,8 @@ The model is deliberately not packaged in the APK. Import it using the Android f
 
 The public [v0.1.0 reviewer APK release](https://github.com/lfyxhappy/Arm-AI-Optimization-Challenge/releases/tag/v0.1.0-reviewer) includes an `arm64-v8a` APK and `SHA256SUMS.txt`. It is deliberately marked as a pre-release because it uses the standard Android debug keystore for evaluator testing; it is not a production-signed distribution. Models are not bundled and must be imported separately.
 
+To reproduce the same evaluator artifact without a private key, run `./tools/package-reviewer-apk.ps1`. It builds and verifies the signed reviewer APK, then writes a timestamped ignored release directory with the APK, `SHA256SUMS.txt`, and an artifact manifest. See [Reviewer APK Packaging](docs/reviewer-apk.md) for the boundary between a reviewer build and a production-signed release.
+
 ## Model Matrix
 
 | Model | Required artifacts | Purpose |

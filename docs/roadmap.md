@@ -54,8 +54,9 @@ The judging emphasis previously checked for this event is technical implementati
 
 - [ ] Replace the generated upstream snapshot with a true submodule at the pinned llama.cpp commit, or document and verify the exact snapshot workflow for a clean clone.
 - [ ] Remove the local proxy-only TLS workaround from release instructions; vendor or fetch KleidiAI through a trusted chain.
-- [ ] Run a Release build, install it on the OnePlus, and verify import, switching, cancellation, export, OOM/context/thermal error messaging.
-- [ ] Check APK size and SHA-256; attach the APK to a public GitHub Release.
+- [x] Build an optimized arm64 `reviewer` APK locally, verify its Android Debug signature and sole `arm64-v8a` ABI, and document the SHA-256/reviewer boundary workflow.
+- [ ] Install the reviewer or production-signed APK on the target device and verify import, switching, cancellation, export, OOM/context/thermal error messaging.
+- [ ] Create a production-signed Release APK, check its size and SHA-256, then attach it to a public GitHub Release.
 
 ### Phase 5 — Submission package
 

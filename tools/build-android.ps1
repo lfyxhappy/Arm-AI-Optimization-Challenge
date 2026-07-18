@@ -1,7 +1,7 @@
 param(
     [ValidateSet("cpu", "snapdragon-opencl", "snapdragon-htp")]
     [string]$Backend = "cpu",
-    [ValidateSet("assembleDebug", "assembleRelease", "testDebugUnitTest")]
+    [ValidateSet("assembleDebug", "assembleRelease", "assembleReviewer", "testDebugUnitTest")]
     [string]$Task = "assembleDebug",
     [string]$AndroidSdkRoot = $env:ANDROID_HOME
 )
