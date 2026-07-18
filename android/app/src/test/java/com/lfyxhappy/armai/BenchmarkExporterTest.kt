@@ -59,6 +59,8 @@ class BenchmarkExporterTest {
             abi = "arm64-v8a",
             config = config,
             inputs = BenchmarkInputs.from("system", "user", 96),
+            runMode = BenchmarkRunMode.AUTO_TUNE,
+            threadCandidates = listOf(2, 4, 6, 8),
             complete = true,
             measurements = listOf(measurement(6, 12.0, 900.0, 9_100_000)),
         )
@@ -71,14 +73,19 @@ class BenchmarkExporterTest {
         assertTrue(json.contains("cpu-q4-fa-on-q8-kv"))
         assertTrue(json.contains("\"flashAttention\":\"enabled\""))
         assertTrue(json.contains("\"kvCacheType\":\"q8_0\""))
+        assertTrue(json.contains("\"runMode\":\"auto_tune\""))
+        assertTrue(json.contains("\"threadCandidates\":[2,4,6,8]"))
         assertTrue(json.contains("\"protocol\":\"fixed-prompt-v1\""))
         assertTrue(json.contains("\"complete\":true"))
         assertTrue(json.contains("\"appApkSha256\":\"apk-sha\""))
         assertTrue(csv.contains("native_decode_ms"))
+        assertTrue(csv.contains("session_run_mode"))
+        assertTrue(csv.contains("\"auto_tune\""))
         assertTrue(csv.contains("input_user_prompt_sha256"))
         assertTrue(csv.contains("\"true\""))
         assertTrue(report.contains("Flash / KV / batch"))
         assertTrue(report.contains("Input fingerprint"))
+        assertTrue(report.contains("Run mode / candidates"))
         assertTrue(report.contains("Split Timing"))
     }
 
@@ -94,6 +101,19 @@ class BenchmarkExporterTest {
     }
 
     @Test
+    fun legacyAggregateHistoryMigratesWithoutDroppingRows() {
+        val legacyHeader = "session_id,stage,session_complete,input_protocol,input_system_prompt_sha256,input_system_prompt_utf8_bytes,input_user_prompt_sha256,input_user_prompt_utf8_bytes,input_max_output_tokens,timestamp,model,sha256,model_bytes,threads,temperature,output_tokens,ttft_ms,end_to_end_ms,tokens_per_second,peak_memory_kb,backend,backend_profile,backend_preference,requested_device,active_device,registered_backends,registered_devices,layer_offload,fallback_reason,batch_size,ubatch_size,flash_attention,kv_cache_type,model_load_ms,context_init_ms,system_prefill_ms,prompt_prefill_ms,native_decode_ms,thermal_status,battery_temperature_c,battery_current_ua,valid,warmup,invalid_reason"
+        val legacyRow = legacyHeader.split(',').indices.joinToString(",") { "\"value$it\"" }
+
+        val migrated = BenchmarkArchiveStore.upgradeHistoryCsvForRunScope("$legacyHeader\n$legacyRow\n")
+        val migratedRow = migrated.lineSequence().drop(1).first()
+
+        assertTrue(migrated.startsWith(BenchmarkExporter.csvHeader()))
+        assertTrue(migratedRow.contains("\"value0\",\"value1\",\"value2\",\"\",\"\",\"value3\""))
+        assertEquals(legacyHeader.split(',').size + 2, migratedRow.split(',').size)
+    }
+
+    @Test
     fun stageJsonKeepsStructuredInputFingerprint() {
         val inputs = BenchmarkInputs.from("system", "user", 96)
         val session = BenchmarkSession(
@@ -106,8 +126,10 @@ class BenchmarkExporterTest {
             abi = "arm64-v8a",
             config = RuntimeConfig(),
             inputs = inputs,
+            runMode = BenchmarkRunMode.TARGETED_REPEAT,
+            threadCandidates = listOf(6),
             complete = true,
-            measurements = listOf(measurement(4, 10.0, 800.0, 8_000_000)),
+            measurements = listOf(measurement(6, 10.0, 800.0, 8_000_000)),
         )
 
         val document = JsonParser.parseString(BenchmarkExporter.json(session, session.measurements)).asJsonObject
@@ -118,6 +140,8 @@ class BenchmarkExporterTest {
         assertEquals(inputs.userPromptSha256, exportedInputs.get("userPromptSha256").asString)
         assertEquals(96, exportedInputs.get("maxOutputTokens").asInt)
         assertEquals("apk-sha-json", document.getAsJsonObject("session").get("appApkSha256").asString)
+        assertEquals("targeted_repeat", document.getAsJsonObject("session").get("runMode").asString)
+        assertEquals(6, document.getAsJsonObject("session").getAsJsonArray("threadCandidates")[0].asInt)
     }
 
     @Test(expected = IllegalArgumentException::class)

@@ -327,7 +327,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun autoTune() = runBenchmarkSession(THREAD_CANDIDATES, "Auto tuning")
+    private fun autoTune() = runBenchmarkSession(THREAD_CANDIDATES, BenchmarkRunMode.AUTO_TUNE)
 
     /**
      * Runs a cooled control at one selected thread count without first heating
@@ -335,9 +335,9 @@ class MainActivity : AppCompatActivity() {
      * immutable stage, but it must be compared only with another targeted
      * session using the same controlled inputs and selected thread count.
      */
-    private fun repeatSelectedThread() = runBenchmarkSession(listOf(selectedThreads()), "Targeted repeat")
+    private fun repeatSelectedThread() = runBenchmarkSession(listOf(selectedThreads()), BenchmarkRunMode.TARGETED_REPEAT)
 
-    private fun runBenchmarkSession(threadCandidates: List<Int>, mode: String) {
+    private fun runBenchmarkSession(threadCandidates: List<Int>, mode: BenchmarkRunMode) {
         val model = currentModel ?: run { toast("Import a GGUF model first"); return }
         require(threadCandidates.isNotEmpty()) { "At least one thread candidate is required" }
         val config = selectedRuntimeConfig()
@@ -350,7 +350,7 @@ class MainActivity : AppCompatActivity() {
         val benchmarkInputs = BenchmarkInputs.from(benchmarkSystemPrompt, benchmarkPrompt, benchmarkMaxTokens)
         benchmarkMeasurements.clear()
         val candidateLabel = threadCandidates.joinToString("/")
-        setBusy(true, "$mode $stage ($candidateLabel threads): 1 warm-up + $MEASURED_RUNS measured runs per thread count...")
+        setBusy(true, "${mode.uiLabel} $stage ($candidateLabel threads): 1 warm-up + $MEASURED_RUNS measured runs per thread count...")
         lifecycleScope.launch(Dispatchers.Default) {
             try {
                 for (threadCount in threadCandidates) {
@@ -367,18 +367,22 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
                 }
-                val archive = archiveBenchmarkSession(stage, config, benchmarkInputs, sessionStartedAt, sessionId, complete = true)
+                val archive = archiveBenchmarkSession(
+                    stage, config, benchmarkInputs, sessionStartedAt, sessionId, mode, threadCandidates, complete = true,
+                )
                 val best = BenchmarkExporter.recommended(benchmarkMeasurements)
                 statusOnMain(best?.let {
                     "Archived $stage (${archive.sessionCount} stages; $candidateLabel threads). Recommended: ${it.threads} threads (${it.meanTokensPerSecond.format(2)} mean tokens/s)"
                 } ?: "Archived $stage (${archive.sessionCount} stages; $candidateLabel threads). No valid measurements: device thermal status was severe")
                 withContext(Dispatchers.Main) { refreshArchiveStatus() }
             } catch (error: Exception) {
-                withContext(Dispatchers.Main) { showError("$mode failed", error) }
+                withContext(Dispatchers.Main) { showError("${mode.uiLabel} failed", error) }
             } finally {
                 if (benchmarkMeasurements.isNotEmpty() && currentBenchmarkSession?.id != sessionId) {
                     runCatching {
-                        archiveBenchmarkSession(stage, config, benchmarkInputs, sessionStartedAt, sessionId, complete = false)
+                        archiveBenchmarkSession(
+                            stage, config, benchmarkInputs, sessionStartedAt, sessionId, mode, threadCandidates, complete = false,
+                        )
                     }.onSuccess {
                         withContext(Dispatchers.Main) { refreshArchiveStatus() }
                     }
@@ -394,6 +398,8 @@ class MainActivity : AppCompatActivity() {
         inputs: BenchmarkInputs,
         startedAt: String,
         sessionId: String,
+        runMode: BenchmarkRunMode,
+        threadCandidates: List<Int>,
         complete: Boolean,
     ): BenchmarkArchiveResult {
         val session = BenchmarkArchiveStore.createSession(
@@ -402,6 +408,8 @@ class MainActivity : AppCompatActivity() {
             config,
             inputs,
             benchmarkMeasurements.toList(),
+            runMode,
+            threadCandidates,
             complete,
             startedAt,
             sessionId,
@@ -769,9 +777,11 @@ internal object BenchmarkExporter {
         append("  ]\n}\n")
     }
 
-    fun csvHeader() = "session_id,stage,session_complete,input_protocol,input_system_prompt_sha256,input_system_prompt_utf8_bytes,input_user_prompt_sha256,input_user_prompt_utf8_bytes,input_max_output_tokens,timestamp,model,sha256,model_bytes,threads,temperature,output_tokens,ttft_ms,end_to_end_ms,tokens_per_second,peak_memory_kb,backend,backend_profile,backend_preference,requested_device,active_device,registered_backends,registered_devices,layer_offload,fallback_reason,batch_size,ubatch_size,flash_attention,kv_cache_type,model_load_ms,context_init_ms,system_prefill_ms,prompt_prefill_ms,native_decode_ms,thermal_status,battery_temperature_c,battery_current_ua,valid,warmup,invalid_reason\n"
+    fun csvHeader() = "session_id,stage,session_complete,session_run_mode,session_thread_candidates,input_protocol,input_system_prompt_sha256,input_system_prompt_utf8_bytes,input_user_prompt_sha256,input_user_prompt_utf8_bytes,input_max_output_tokens,timestamp,model,sha256,model_bytes,threads,temperature,output_tokens,ttft_ms,end_to_end_ms,tokens_per_second,peak_memory_kb,backend,backend_profile,backend_preference,requested_device,active_device,registered_backends,registered_devices,layer_offload,fallback_reason,batch_size,ubatch_size,flash_attention,kv_cache_type,model_load_ms,context_init_ms,system_prefill_ms,prompt_prefill_ms,native_decode_ms,thermal_status,battery_temperature_c,battery_current_ua,valid,warmup,invalid_reason\n"
 
-    fun csv(session: BenchmarkSession, items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(items, session.complete, session.inputs)
+    fun csv(session: BenchmarkSession, items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(
+        items, session.complete, session.inputs, session.runMode, session.threadCandidates,
+    )
 
     fun csv(items: List<BenchmarkMeasurement>) = csvHeader() + csvRows(items)
 
@@ -779,8 +789,10 @@ internal object BenchmarkExporter {
         items: List<BenchmarkMeasurement>,
         sessionComplete: Boolean? = null,
         inputs: BenchmarkInputs? = null,
+        runMode: BenchmarkRunMode? = null,
+        threadCandidates: List<Int> = emptyList(),
     ) = buildString {
-        items.forEach { append(it.csv(sessionComplete, inputs)).append('\n') }
+        items.forEach { append(it.csv(sessionComplete, inputs, runMode, threadCandidates)).append('\n') }
     }
 
     fun report(session: BenchmarkSession?, items: List<BenchmarkMeasurement>): String {
@@ -797,6 +809,7 @@ internal object BenchmarkExporter {
                 append("<h2>Reproducibility</h2><table><tr><th>Session</th><td>").append(html(session.id)).append("</td></tr>")
                 append("<tr><th>Started</th><td>").append(html(session.startedAt)).append("</td></tr>")
                 append("<tr><th>Stage status</th><td>").append(if (session.complete) "completed" else "partial").append("</td></tr>")
+                append("<tr><th>Run mode / candidates</th><td>").append(html(session.runMode.uiLabel)).append(" / ").append(html(session.threadCandidates.joinToString("/"))).append("</td></tr>")
                 append("<tr><th>App / ABI / APK SHA-256</th><td>").append(html(session.appVersion)).append(" / ").append(html(session.abi)).append(" / ").append(html(session.appApkSha256)).append("</td></tr>")
                 append("<tr><th>Flash / KV / batch</th><td>").append(html(config!!.flashAttention.name)).append(" / ")
                 append(html(config.kvCacheType.name)).append(" / ").append(config.batchSize).append(" / ").append(config.ubatchSize).append("</td></tr></table>")
@@ -824,14 +837,19 @@ internal object BenchmarkExporter {
 
     private fun runtimeRow(label: String, value: BenchmarkMeasurement?): String = "<tr><td>${html(label)}</td><td>${html(value?.backendProfile ?: "n/a")}</td><td>${html(value?.requestedDevice ?: "n/a")} / ${html(value?.activeDevice ?: "n/a")}</td><td>${html(value?.flashAttention ?: "n/a")} / ${html(value?.kvCacheType ?: "n/a")}</td><td>${html(value?.layerOffload ?: "n/a")}</td><td>${html(value?.fallbackReason ?: "none")}</td></tr>"
 
-    private fun BenchmarkSession.json() = "\"id\":\"${escape(id)}\",\"stage\":\"${escape(stage)}\",\"startedAt\":\"${escape(startedAt)}\",\"complete\":$complete,\"appVersion\":\"${escape(appVersion)}\",\"appApkSha256\":\"${escape(appApkSha256)}\",\"deviceFingerprint\":\"${escape(deviceFingerprint)}\",\"abi\":\"${escape(abi)}\",\"runtimeConfig\":{\"threads\":${config.threads},\"temperature\":${config.temperature},\"backendPreference\":\"${escape(config.backendPreference.name.lowercase())}\",\"flashAttention\":\"${escape(config.flashAttention.name.lowercase())}\",\"kvCacheType\":\"${escape(config.kvCacheType.name.lowercase())}\",\"batchSize\":${config.batchSize},\"ubatchSize\":${config.ubatchSize}},\"inputs\":{${inputs.json()}}"
+    private fun BenchmarkSession.json() = "\"id\":\"${escape(id)}\",\"stage\":\"${escape(stage)}\",\"startedAt\":\"${escape(startedAt)}\",\"complete\":$complete,\"runMode\":\"${runMode.persistedValue}\",\"threadCandidates\":[${threadCandidates.joinToString(",")}],\"appVersion\":\"${escape(appVersion)}\",\"appApkSha256\":\"${escape(appApkSha256)}\",\"deviceFingerprint\":\"${escape(deviceFingerprint)}\",\"abi\":\"${escape(abi)}\",\"runtimeConfig\":{\"threads\":${config.threads},\"temperature\":${config.temperature},\"backendPreference\":\"${escape(config.backendPreference.name.lowercase())}\",\"flashAttention\":\"${escape(config.flashAttention.name.lowercase())}\",\"kvCacheType\":\"${escape(config.kvCacheType.name.lowercase())}\",\"batchSize\":${config.batchSize},\"ubatchSize\":${config.ubatchSize}},\"inputs\":{${inputs.json()}}"
 
     private fun BenchmarkInputs.json() = "\"protocol\":\"${escape(protocol)}\",\"systemPromptSha256\":\"${escape(systemPromptSha256)}\",\"systemPromptUtf8Bytes\":$systemPromptUtf8Bytes,\"userPromptSha256\":\"${escape(userPromptSha256)}\",\"userPromptUtf8Bytes\":$userPromptUtf8Bytes,\"maxOutputTokens\":$maxOutputTokens"
 
     private fun BenchmarkMeasurement.json() = "\"sessionId\":\"${escape(sessionId)}\",\"stage\":\"${escape(stage)}\",\"timestamp\":\"${escape(timestamp)}\",\"model\":\"${escape(modelName)}\",\"sha256\":\"$modelSha256\",\"modelBytes\":$modelBytes,\"threads\":$threads,\"temperature\":$temperature,\"outputTokens\":$outputTokens,\"ttftMs\":$ttftMs,\"endToEndMs\":$elapsedMs,\"tokensPerSecond\":$tokensPerSecond,\"peakMemoryKb\":$peakMemoryKb,\"backend\":\"${escape(backend)}\",\"backendProfile\":\"${escape(backendProfile)}\",\"backendPreference\":\"${escape(backendPreference)}\",\"requestedDevice\":\"${escape(requestedDevice)}\",\"activeDevice\":\"${escape(activeDevice)}\",\"registeredBackends\":\"${escape(registeredBackends)}\",\"registeredDevices\":\"${escape(registeredDevices)}\",\"layerOffload\":\"${escape(layerOffload)}\",\"fallbackReason\":${fallbackReason?.let { "\"${escape(it)}\"" } ?: "null"},\"batchSize\":$batchSize,\"ubatchSize\":$ubatchSize,\"flashAttention\":\"${escape(flashAttention)}\",\"kvCacheType\":\"${escape(kvCacheType)}\",\"modelLoadMs\":$modelLoadMs,\"contextInitMs\":$contextInitMs,\"systemPrefillMs\":$systemPrefillMs,\"promptPrefillMs\":$promptPrefillMs,\"nativeDecodeMs\":$nativeDecodeMs,\"thermalStatus\":$thermalStatus,\"batteryTemperatureC\":${batteryTemperatureC ?: "null"},\"batteryCurrentUa\":${batteryCurrentUa ?: "null"},\"valid\":$valid,\"warmup\":$warmup,\"invalidReason\":${invalidReason?.let { "\"${escape(it)}\"" } ?: "null"}"
 
-    private fun BenchmarkMeasurement.csv(sessionComplete: Boolean?, inputs: BenchmarkInputs?) = listOf(
-        sessionId, stage, sessionComplete,
+    private fun BenchmarkMeasurement.csv(
+        sessionComplete: Boolean?,
+        inputs: BenchmarkInputs?,
+        runMode: BenchmarkRunMode?,
+        threadCandidates: List<Int>,
+    ) = listOf(
+        sessionId, stage, sessionComplete, runMode?.persistedValue, threadCandidates.joinToString("|"),
         inputs?.protocol, inputs?.systemPromptSha256, inputs?.systemPromptUtf8Bytes,
         inputs?.userPromptSha256, inputs?.userPromptUtf8Bytes, inputs?.maxOutputTokens,
         timestamp, modelName, modelSha256, modelBytes, threads, temperature, outputTokens,

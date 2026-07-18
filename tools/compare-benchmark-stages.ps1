@@ -110,6 +110,8 @@ function New-LegacySession {
         appApkSha256 = "legacy-unknown"
         deviceFingerprint = "legacy-unknown"
         abi = "unknown"
+        runMode = "not-recorded"
+        threadCandidates = @()
         runtimeConfig = [pscustomobject]@{
             threads = Get-IntValue -Object $first -Name "threads"
             temperature = Get-DoubleValue -Object $first -Name "temperature"
@@ -147,6 +149,15 @@ function New-StageSummary {
     $modelSha256 = Get-TextValue -Object $metadataSample -Name "sha256"
     $modelBytes = Get-PropertyValue -Object $metadataSample -Name "modelBytes" -Default 0
     $deviceFingerprint = Get-TextValue -Object $session -Name "deviceFingerprint"
+    $runMode = Get-TextValue -Object $session -Name "runMode" -Default "not-recorded"
+    $threadCandidates = @(
+        @(Get-PropertyValue -Object $session -Name "threadCandidates" -Default @()) |
+            ForEach-Object {
+                try { [int]$_ } catch { }
+            } |
+            Sort-Object -Unique
+    )
+    $threadCandidateText = if ($threadCandidates.Count -gt 0) { $threadCandidates -join "/" } else { "not-recorded" }
 
     $validMeasurements = @()
     if ($complete -or $SummarizePartial -or $legacy) {
@@ -198,18 +209,22 @@ function New-StageSummary {
         "comparable"
     }
 
-    $configText = "pref={0}; flash={1}; kv={2}; batch={3}/{4}" -f `
+    $configText = "pref={0}; flash={1}; kv={2}; batch={3}/{4}; run={5}; candidates={6}" -f `
         (Get-TextValue -Object $runtimeConfig -Name "backendPreference"),
         (Get-TextValue -Object $runtimeConfig -Name "flashAttention"),
         (Get-TextValue -Object $runtimeConfig -Name "kvCacheType"),
         (Get-PropertyValue -Object $runtimeConfig -Name "batchSize" -Default ""),
-        (Get-PropertyValue -Object $runtimeConfig -Name "ubatchSize" -Default "")
+        (Get-PropertyValue -Object $runtimeConfig -Name "ubatchSize" -Default ""),
+        $runMode,
+        $threadCandidateText
 
     return [pscustomobject]@{
         session_id = Get-TextValue -Object $session -Name "id"
         stage = Get-TextValue -Object $session -Name "stage"
         started_at = Get-TextValue -Object $session -Name "startedAt"
         session_complete = if ($legacy) { $null } else { $complete }
+        run_mode = $runMode
+        thread_candidates = $threadCandidateText
         comparison_state = $comparisonState
         comparison_group = $comparisonGroup
         schema = Get-TextValue -Object $Record.document -Name "schema"
@@ -345,7 +360,7 @@ $destination = Join-Path $resolvedOutputRoot "comparison-$timestamp-$PID"
 New-Item -ItemType Directory -Path $destination -ErrorAction Stop | Out-Null
 
 $csvColumns = @(
-    "session_id", "stage", "started_at", "session_complete", "comparison_state", "comparison_group",
+    "session_id", "stage", "started_at", "session_complete", "run_mode", "thread_candidates", "comparison_state", "comparison_group",
     "schema", "app_version", "app_apk_sha256", "device_fingerprint", "abi", "model_sha256", "model_bytes",
     "input_protocol", "system_prompt_sha256", "system_prompt_utf8_bytes", "user_prompt_sha256", "user_prompt_utf8_bytes", "max_output_tokens", "temperature",
     "configuration", "actual_backend", "backend_profile", "requested_device", "active_device",
@@ -359,12 +374,12 @@ $csvPath = Join-Path $destination "stage-comparison.csv"
     Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
 
 $displayColumns = @(
-    "stage", "comparison_state", "app_version", "app_apk_sha256", "configuration", "actual_backend", "optimized_threads",
+    "stage", "run_mode", "thread_candidates", "comparison_state", "app_version", "app_apk_sha256", "configuration", "actual_backend", "optimized_threads",
     "optimized_valid_runs", "optimized_mean_ttft_ms", "optimized_mean_tokens_per_second", "optimized_max_peak_memory_kb",
     "delta_optimized_tokens_per_second_pct", "delta_optimized_ttft_pct", "session_id"
 )
 $headings = @{
-    stage = "Stage"; comparison_state = "State"; app_version = "App"; app_apk_sha256 = "APK SHA-256"; configuration = "Requested configuration"; actual_backend = "Actual backend";
+    stage = "Stage"; run_mode = "Run mode"; thread_candidates = "Candidate threads"; comparison_state = "State"; app_version = "App"; app_apk_sha256 = "APK SHA-256"; configuration = "Requested configuration"; actual_backend = "Actual backend";
     optimized_threads = "Recommended threads"; optimized_valid_runs = "Valid runs"; optimized_mean_ttft_ms = "Mean TTFT (ms)";
     optimized_mean_tokens_per_second = "Mean tokens/s"; optimized_max_peak_memory_kb = "Peak memory max (KB)";
     delta_optimized_tokens_per_second_pct = "tokens/s delta (%)"; delta_optimized_ttft_pct = "TTFT improvement (%)"; session_id = "Session"
@@ -372,7 +387,7 @@ $headings = @{
 $htmlBuilder = [System.Text.StringBuilder]::new()
 [void]$htmlBuilder.Append('<!doctype html><html><head><meta charset="utf-8"><title>Arm Mobile AI Stage Comparison</title><style>body{font-family:system-ui,sans-serif;margin:32px;color:#17212b}table{border-collapse:collapse;width:100%;margin:12px 0 28px}th,td{padding:8px;border:1px solid #b9c2ca;text-align:left;vertical-align:top}th{background:#e8f1f3}code{background:#f2f4f5;padding:2px 4px}</style></head><body>')
 [void]$htmlBuilder.Append("<h1>Arm Mobile AI stage comparison</h1><p>Generated UTC: <code>").Append((Html (Get-Date).ToUniversalTime().ToString("o"))).Append("</code>. Raw archives are never rewritten; duplicate pulls of identical session JSON are de-duplicated by session ID and SHA-256.</p>")
-[void]$htmlBuilder.Append("<p>Comparison group requires the same device fingerprint, model hash/size, input protocol, system/user prompt fingerprints, maximum output tokens, and temperature. <code>legacy-inputs-missing</code> archives remain visible but are not considered controlled cross-stage evidence.</p>")
+[void]$htmlBuilder.Append("<p>Comparison group requires the same device fingerprint, model hash/size, input protocol, system/user prompt fingerprints, maximum output tokens, and temperature. Run mode and candidate threads are displayed for auditability; a targeted repeat must only be interpreted against a matching same-thread control. <code>legacy-inputs-missing</code> archives remain visible but are not considered controlled cross-stage evidence.</p>")
 if ([string]::IsNullOrWhiteSpace($BaselineStage)) {
     [void]$htmlBuilder.Append("<p>No baseline stage was selected, so delta columns are intentionally blank. Re-run with <code>-BaselineStage &lt;stage-name&gt;</code> to calculate deltas within each compatible group.</p>")
 } else {
